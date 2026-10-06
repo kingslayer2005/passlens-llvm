@@ -1,0 +1,15 @@
+# Pinned dependencies for LLVM IR SHAP research project
+# Python 3.10+ required
+xgboost-cpu
+shap
+scikit-learn
+pandas
+matplotlib
+numpy
+scipy
+pyyaml
+joblib
+tqdm
+seaborn
+
+tabulate==0.10.0

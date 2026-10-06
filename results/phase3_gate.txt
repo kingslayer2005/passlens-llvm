@@ -1,0 +1,12 @@
+
+╔══════════════════════════════════════════════════════╗
+║              PHASE 3 GATE REPORT                     ║
+╠══════════════════════════════════════════════════════╣
+║ Total samples:               720                     ║
+║ Functions:                    10                     ║
+║ Passes (active):              18                     ║
+║ Passes (kept):                 6                     ║
+║ Passes (dropped):             12                     ║
+╠══════════════════════════════════════════════════════╣
+║ Dropped passes: sroa, sccp, adce, dse, reassociate, correlated-propagation, licm, loop-rotate, loop-deletion, loop-idiom, loop-unroll, tailcallelim║
+╚══════════════════════════════════════════════════════╝

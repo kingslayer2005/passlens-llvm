@@ -1,0 +1,5 @@
+pass_name,hit_at_5,mrr,direction_agreement,random_hit_at_5,random_mrr,n_heuristic_features
+simplifycfg,0.0,0.0338,0.3333,0.0615,0.0303,4
+early-cse,0.3333,0.1389,0.0,0.0462,0.0303,3
+jump-threading,0.0,0.0352,0.5,0.0462,0.0303,3
+indvars,0.0,0.0609,0.0,0.0462,0.0303,3

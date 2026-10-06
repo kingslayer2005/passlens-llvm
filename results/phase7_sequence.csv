@@ -1,0 +1,5 @@
+suite,program,function,initial_count,greedy_count,greedy_steps,greedy_sequence,oz_count,o2_count,random_count,random_steps,oracle_count,oracle_steps,oracle_sequence,greedy_reduction,oz_reduction,o2_reduction,random_reduction,oracle_reduction
+polybench,bicg,main,35,24,1,early-cse,24,24,24,1,24,1,instcombine,0.3143,0.3143,0.3143,0.3143,0.3143
+polybench,bicg,init_array,59,51,2,simplifycfg;jump-threading,52,89,56,2,47,3,gvn;simplifycfg;instcombine,0.1356,0.1186,-0.5085,0.0508,0.2034
+polybench,bicg,kernel_bicg,70,56,2,early-cse;early-cse,48,40,56,2,47,3,gvn;simplifycfg;instcombine,0.2,0.3143,0.4286,0.2,0.3286
+polybench,bicg,print_array,61,57,2,simplifycfg;simplifycfg,61,55,61,2,57,1,simplifycfg,0.0656,0.0,0.0984,0.0,0.0656

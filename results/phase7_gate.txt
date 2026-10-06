@@ -1,0 +1,11 @@
+
+╔══════════════════════════════════════════════════════╗
+║              PHASE 7 GATE REPORT                     ║
+╠══════════════════════════════════════════════════════╣
+║ Held-out functions:            4                     ║
+║ Greedy mean reduction:     17.9%%                    ║
+║ -Oz mean reduction:        18.7%%                    ║
+║ -O2 mean reduction:         8.3%%                    ║
+║ Random mean reduction:     14.1%%                    ║
+║ Oracle mean reduction:     22.8%%                    ║
+╚══════════════════════════════════════════════════════╝

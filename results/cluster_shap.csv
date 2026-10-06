@@ -1,0 +1,97 @@
+pass_name,cluster_id,members,mean_abs_shap
+simplifycfg,6,int_arith_count; icmp_count; store_count; phi_count; call_count; cast_count; cond_br_count; uncond_br_count; bb_count; cfg_edges; blocks_1_pred; blocks_2_pred; blocks_1_succ; blocks_2_succ; phi_args_total; direct_call_count; log_inst_count; int_arith_density; phi_density; call_density; cast_density; ret_density; uncond_br_density; bb_density; cfg_edges_density; blocks_1_pred_density; blocks_1_succ_density; phi_args_total_density; direct_call_density; loop_count; max_loop_depth; loop_count_density,1.9548028707504272
+simplifycfg,5,fp_arith_count; fp_arith_density,0.035160474479198456
+simplifycfg,12,fcmp_count,0.0
+simplifycfg,1,load_count; load_density,0.21236054599285126
+simplifycfg,3,gep_count,0.245930477976799
+simplifycfg,4,alloca_count; alloca_density,0.0
+simplifycfg,13,select_count,0.0
+simplifycfg,14,ret_count,0.0
+simplifycfg,15,invoke_count,0.0
+simplifycfg,16,switch_count,0.0
+simplifycfg,10,blocks_gt2_pred; blocks_gt2_pred_density,0.0
+simplifycfg,17,blocks_gt2_succ,0.0
+simplifycfg,9,const_operands; const_operands_density,0.14911794662475586
+simplifycfg,2,intrinsic_call_count; intrinsic_call_density,0.0
+simplifycfg,18,self_recursive_call_count,0.0
+simplifycfg,8,icmp_density; cond_br_density; blocks_2_succ_density,0.26713839173316956
+simplifycfg,19,fcmp_density,0.0
+simplifycfg,7,store_density,0.0
+simplifycfg,11,gep_density; blocks_2_pred_density; max_loop_depth_density,0.14545533061027527
+simplifycfg,20,select_density,0.0
+simplifycfg,21,invoke_density,0.0
+simplifycfg,22,switch_density,0.0
+simplifycfg,23,blocks_gt2_succ_density,0.0
+simplifycfg,24,self_recursive_call_density,0.0
+early-cse,6,int_arith_count; icmp_count; store_count; phi_count; call_count; cast_count; cond_br_count; uncond_br_count; bb_count; cfg_edges; blocks_1_pred; blocks_2_pred; blocks_1_succ; blocks_2_succ; phi_args_total; direct_call_count; log_inst_count; int_arith_density; phi_density; call_density; cast_density; ret_density; uncond_br_density; bb_density; cfg_edges_density; blocks_1_pred_density; blocks_1_succ_density; phi_args_total_density; direct_call_density; loop_count; max_loop_depth; loop_count_density,0.7710109949111938
+early-cse,5,fp_arith_count; fp_arith_density,0.037530578672885895
+early-cse,12,fcmp_count,0.0
+early-cse,1,load_count; load_density,0.1007494330406189
+early-cse,3,gep_count,0.7532249689102173
+early-cse,4,alloca_count; alloca_density,0.0
+early-cse,13,select_count,0.0
+early-cse,14,ret_count,0.0
+early-cse,15,invoke_count,0.0
+early-cse,16,switch_count,0.0
+early-cse,10,blocks_gt2_pred; blocks_gt2_pred_density,0.0
+early-cse,17,blocks_gt2_succ,0.0
+early-cse,9,const_operands; const_operands_density,0.3444165587425232
+early-cse,2,intrinsic_call_count; intrinsic_call_density,0.0
+early-cse,18,self_recursive_call_count,0.0
+early-cse,8,icmp_density; cond_br_density; blocks_2_succ_density,0.5194891691207886
+early-cse,19,fcmp_density,0.0
+early-cse,7,store_density,0.0
+early-cse,11,gep_density; blocks_2_pred_density; max_loop_depth_density,0.29444950819015503
+early-cse,20,select_density,0.0
+early-cse,21,invoke_density,0.0
+early-cse,22,switch_density,0.0
+early-cse,23,blocks_gt2_succ_density,0.0
+early-cse,24,self_recursive_call_density,0.0
+jump-threading,6,int_arith_count; icmp_count; store_count; phi_count; call_count; cast_count; cond_br_count; uncond_br_count; bb_count; cfg_edges; blocks_1_pred; blocks_2_pred; blocks_1_succ; blocks_2_succ; phi_args_total; direct_call_count; log_inst_count; int_arith_density; phi_density; call_density; cast_density; ret_density; uncond_br_density; bb_density; cfg_edges_density; blocks_1_pred_density; blocks_1_succ_density; phi_args_total_density; direct_call_density; loop_count; max_loop_depth; loop_count_density,2.3284945487976074
+jump-threading,5,fp_arith_count; fp_arith_density,0.04831286147236824
+jump-threading,12,fcmp_count,0.0
+jump-threading,1,load_count; load_density,0.28536590933799744
+jump-threading,3,gep_count,0.21644091606140137
+jump-threading,4,alloca_count; alloca_density,0.0
+jump-threading,13,select_count,0.0
+jump-threading,14,ret_count,0.0
+jump-threading,15,invoke_count,0.0
+jump-threading,16,switch_count,0.0
+jump-threading,10,blocks_gt2_pred; blocks_gt2_pred_density,0.0
+jump-threading,17,blocks_gt2_succ,0.0
+jump-threading,9,const_operands; const_operands_density,0.09228026866912842
+jump-threading,2,intrinsic_call_count; intrinsic_call_density,0.0
+jump-threading,18,self_recursive_call_count,0.0
+jump-threading,8,icmp_density; cond_br_density; blocks_2_succ_density,0.30924949049949646
+jump-threading,19,fcmp_density,0.0
+jump-threading,7,store_density,0.0
+jump-threading,11,gep_density; blocks_2_pred_density; max_loop_depth_density,0.41425007581710815
+jump-threading,20,select_density,0.0
+jump-threading,21,invoke_density,0.0
+jump-threading,22,switch_density,0.0
+jump-threading,23,blocks_gt2_succ_density,0.0
+jump-threading,24,self_recursive_call_density,0.0
+indvars,6,int_arith_count; icmp_count; store_count; phi_count; call_count; cast_count; cond_br_count; uncond_br_count; bb_count; cfg_edges; blocks_1_pred; blocks_2_pred; blocks_1_succ; blocks_2_succ; phi_args_total; direct_call_count; log_inst_count; int_arith_density; phi_density; call_density; cast_density; ret_density; uncond_br_density; bb_density; cfg_edges_density; blocks_1_pred_density; blocks_1_succ_density; phi_args_total_density; direct_call_density; loop_count; max_loop_depth; loop_count_density,0.9320914149284363
+indvars,5,fp_arith_count; fp_arith_density,0.0
+indvars,12,fcmp_count,0.0
+indvars,1,load_count; load_density,0.6387927532196045
+indvars,3,gep_count,0.3140331506729126
+indvars,4,alloca_count; alloca_density,0.0
+indvars,13,select_count,0.0
+indvars,14,ret_count,0.0
+indvars,15,invoke_count,0.0
+indvars,16,switch_count,0.0
+indvars,10,blocks_gt2_pred; blocks_gt2_pred_density,0.0
+indvars,17,blocks_gt2_succ,0.0
+indvars,9,const_operands; const_operands_density,0.02522788755595684
+indvars,2,intrinsic_call_count; intrinsic_call_density,0.0
+indvars,18,self_recursive_call_count,0.0
+indvars,8,icmp_density; cond_br_density; blocks_2_succ_density,0.10878579318523407
+indvars,19,fcmp_density,0.0
+indvars,7,store_density,0.0
+indvars,11,gep_density; blocks_2_pred_density; max_loop_depth_density,0.0
+indvars,20,select_density,0.0
+indvars,21,invoke_density,0.0
+indvars,22,switch_density,0.0
+indvars,23,blocks_gt2_succ_density,0.0
+indvars,24,self_recursive_call_density,0.0

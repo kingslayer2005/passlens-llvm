@@ -1,0 +1,1 @@
+["instcombine", "simplifycfg", "early-cse", "gvn", "jump-threading", "indvars"]
