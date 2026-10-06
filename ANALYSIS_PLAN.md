@@ -30,7 +30,7 @@ Both targets use the same features and the same cross-validation scheme.
 | Parameter | Value |
 |---|---|
 | Outer CV | Repeated StratifiedGroupKFold, 3 repeats x 5 folds |
-| Grouping variable | `program` |
+| Grouping variable | `program` (capped at 100 functions per program, seeded sample) |
 | Inner CV (nested tuning) | StratifiedGroupKFold, 3 folds |
 | Tuning budget | At most 10 random configurations |
 | Imbalance handling | `scale_pos_weight = n_neg / n_pos` |
@@ -116,9 +116,14 @@ Metric: PR-AUC drop relative to full-feature model.
 
 | Test | Detail |
 |---|---|
+| Split categories | Applicability (what the pass needs to fire) vs Cost_Model (profitability thresholds) |
+| Feature correlation | Clustered using Spearman \|rho\| > 0.8; agreement checks treat correlated features as equivalent hits |
 | Permutation null | 10 000 random rankings per pass |
 | Correction | Holm-Bonferroni across passes |
 | Metrics | hit@5, MRR with bootstrap 95 % CI |
+| Cross-pass control | Score each pass's SHAP ranking against *every other pass's* expected list (matching target direction: beneficial vs harmful). Report if agreement with its own list is higher than the mean agreement with other passes' lists. |
+| Pooled test | Across all passes and targets, compute the mean percentile rank of expected features vs 10,000 permutations within each (pass, target). |
+| Threshold analysis | For cost_model entries with `direction: threshold`, compute the feature value where mean SHAP changes sign (crossover) and plot SHAP dependence. |
 
 ## 9. Sequence Evaluation
 
@@ -141,5 +146,5 @@ Recompute the beneficial label at thresholds 0.5 %, 1 %, 2 % from the stored
 
 1. If unique functions < 1 000 after Phase 1 -> **STOP**.
 2. If a pass has positive rate outside [5 %, 95 %] -> **drop** that pass for that target.
-3. If XGBoost does not beat majority after Holm correction -> **do not interpret** that pass.
-4. If SHAP stability tau < 0.6 -> **do not interpret** that pass.
+3. If XGBoost does not beat majority after Holm correction -> **do not interpret** that target. (Gating is per target).
+4. If SHAP stability tau < 0.6 -> **do not interpret** that target. (Gating is per target).
