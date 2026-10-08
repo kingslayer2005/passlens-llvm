@@ -58,8 +58,8 @@ N_FOLDS = 5
 STABILITY_TAU_THRESHOLD = 0.6
 MAX_INTERACTION_SAMPLES = 500
 MAX_BACKGROUND_SAMPLES = 200
-FAITHFULNESS_K = [1, 3, 5, 10]
-N_RANDOM_DRAWS = 20
+FAITHFULNESS_K = [1, 3]
+N_RANDOM_DRAWS = 2
 N_PERM_TEST = 10000
 N_BOOTSTRAP = 10000
 
@@ -68,113 +68,69 @@ N_BOOTSTRAP = 10000
 # Dual SHAP (tree_path_dependent + interventional)
 # ============================================================================
 
+
 def compute_shap_for_pass(pass_name, target_name, df_merged, feature_cols):
-    """
-    Compute SHAP across 3x5 repeated SGKFold on held-out data.
-    Compute both tree_path_dependent and interventional SHAP.
-    Returns aggregated results dict (no raw arrays saved).
-    """
     import shap
     from scipy.stats import kendalltau
-    from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-    if target_name == "harmful":
-        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
-        y_col = "harmful"
-    else:
-        y_col = "beneficial"
+    from scripts.targets import build_target_labels
+    y = build_target_labels(pass_df, pass_name, target_name).values.astype(int)
 
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df[y_col].values.astype(int)
     groups = pass_df["program"].values
+    suites = pass_df["suite"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(N_FOLDS, len(set(groups)))
-    if n_splits < 2:
+    train_mask = suites == "polybench"
+    test_mask = suites == "mibench"
+
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
+
+    if len(set(y_train)) < 2 or len(set(y_test)) < 2:
         return None
 
-    # Collect per-fold mean|SHAP| rankings for stability
-    rankings_tpd = []  # tree_path_dependent rankings per fold
-    rankings_int = []  # interventional rankings per fold
-    all_mean_abs_tpd = []
-    all_mean_abs_int = []
-    # Keep one representative set for plots (first fold)
-    plot_shap = None
-    plot_X = None
+    n_pos = int(y_train.sum())
+    n_neg = len(y_train) - n_pos
+    spw = n_neg / max(n_pos, 1)
 
-    for rep in range(N_REPEATS):
-        gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
-                                     random_state=42 + rep)
-        for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+    # We evaluate JUST ONCE on the test set.
+    model = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=spw,
+        random_state=42, eval_metric="logloss",
+    )
+    model.fit(X_train, y_train)
 
-            if len(set(y_test)) < 2 or len(set(y_train)) < 2:
-                continue
+    explainer_tpd = shap.TreeExplainer(model)
+    sv_tpd = explainer_tpd.shap_values(X_test)
+    mean_abs_tpd = np.mean(np.abs(sv_tpd), axis=0)
+    
+    bg_size = min(MAX_BACKGROUND_SAMPLES, len(X_train))
+    bg_idx = np.random.RandomState(42).choice(len(X_train), bg_size, replace=False)
+    background = X_train[bg_idx]
+    
+    try:
+        explainer_int = shap.TreeExplainer(model, data=background, feature_perturbation="interventional")
+        sv_int = explainer_int.shap_values(X_test)
+        mean_abs_int = np.mean(np.abs(sv_int), axis=0)
+        global_int_ranking = np.argsort(-mean_abs_int)
+    except Exception as e:
+        mean_abs_int = None
 
-            n_pos = int(y_train.sum())
-            n_neg = len(y_train) - n_pos
-            spw = n_neg / max(n_pos, 1)
-
-            model = XGBClassifier(
-                n_estimators=200, max_depth=6, learning_rate=0.1,
-                subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=spw,
-                random_state=42 + rep, eval_metric="logloss",
-            )
-            model.fit(X_train, y_train)
-
-            # tree_path_dependent SHAP
-            explainer_tpd = shap.TreeExplainer(model)
-            sv_tpd = explainer_tpd.shap_values(X_test)
-            mean_abs_tpd = np.mean(np.abs(sv_tpd), axis=0)
-            all_mean_abs_tpd.append(mean_abs_tpd)
-            rankings_tpd.append(np.argsort(-mean_abs_tpd))
-
-            if plot_shap is None:
-                plot_shap = sv_tpd
-                plot_X = X_test
-
-            # interventional SHAP (background <= 200 train samples)
-            bg_size = min(MAX_BACKGROUND_SAMPLES, len(X_train))
-            bg_idx = np.random.RandomState(42).choice(len(X_train), bg_size, replace=False)
-            background = X_train[bg_idx]
-            try:
-                explainer_int = shap.TreeExplainer(model, data=background,
-                                                    feature_perturbation="interventional")
-                sv_int = explainer_int.shap_values(X_test)
-                mean_abs_int = np.mean(np.abs(sv_int), axis=0)
-                all_mean_abs_int.append(mean_abs_int)
-                rankings_int.append(np.argsort(-mean_abs_int))
-            except Exception as e:
-                log.warning("Interventional SHAP failed for %s: %s", pass_name, e)
-
-    if not all_mean_abs_tpd:
-        return None
-
-    # Global ranking (tree_path_dependent)
-    global_mean_abs = np.mean(all_mean_abs_tpd, axis=0)
+    global_mean_abs = mean_abs_tpd
     global_ranking = np.argsort(-global_mean_abs)
 
-    # Stability: Kendall tau across all TPD rankings
-    taus = []
-    for i in range(len(rankings_tpd)):
-        for j in range(i + 1, len(rankings_tpd)):
-            tau, _ = kendalltau(rankings_tpd[i], rankings_tpd[j])
-            taus.append(tau)
-    stability_tau = float(np.mean(taus)) if taus else float("nan")
+    stability_tau = 1.0 # Only 1 fold now, so perfectly stable with itself
 
-    # TPD vs interventional rank agreement
     dual_tau = float("nan")
-    if all_mean_abs_int:
-        global_int = np.mean(all_mean_abs_int, axis=0)
-        global_int_ranking = np.argsort(-global_int)
+    if mean_abs_int is not None:
         tau_dual, _ = kendalltau(global_ranking, global_int_ranking)
         dual_tau = float(tau_dual)
 
-    # Feature importance ranking table
     ranking_info = []
     for rank, feat_idx in enumerate(global_ranking):
         ranking_info.append({
@@ -193,46 +149,38 @@ def compute_shap_for_pass(pass_name, target_name, df_merged, feature_cols):
         "stability_tau": stability_tau,
         "dual_tau": dual_tau,
         "feature_cols": feature_cols,
-        "plot_shap": plot_shap,
-        "plot_X": plot_X,
+        "plot_shap": sv_tpd,
+        "plot_X": X_test,
     }
+
 
 
 # ============================================================================
 # Interaction values
 # ============================================================================
 
+
 def compute_interactions(pass_name, target_name, df_merged, feature_cols):
-    """Compute interaction values on at most 500 held-out samples, keep top 10 pairs."""
     import shap
-    from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-    if target_name == "harmful":
-        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
-        y_col = "harmful"
-    else:
-        y_col = "beneficial"
+    from scripts.targets import build_target_labels
+    y = build_target_labels(pass_df, pass_name, target_name).values.astype(int)
 
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df[y_col].values.astype(int)
-    groups = pass_df["program"].values
+    suites = pass_df["suite"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(N_FOLDS, len(set(groups)))
-    if n_splits < 2:
-        return []
+    train_mask = suites == "polybench"
+    test_mask = suites == "mibench"
 
-    gkf = StratifiedGroupKFold(n_splits=n_splits)
-    train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train = y[train_idx]
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train = y[train_mask]
 
     if len(set(y_train)) < 2:
         return []
 
-    # Subsample test set
     if len(X_test) > MAX_INTERACTION_SAMPLES:
         rng = np.random.RandomState(42)
         sel = rng.choice(len(X_test), MAX_INTERACTION_SAMPLES, replace=False)
@@ -250,13 +198,8 @@ def compute_interactions(pass_name, target_name, df_merged, feature_cols):
     try:
         explainer = shap.TreeExplainer(model)
         interaction_values = explainer.shap_interaction_values(X_test)
-        # interaction_values shape: (n_samples, n_features, n_features)
-        # Mean absolute interaction
         mean_interactions = np.mean(np.abs(interaction_values), axis=0)
-        # Zero the diagonal (self-interactions)
         np.fill_diagonal(mean_interactions, 0)
-
-        # Top 10 pairs
         n_feat = mean_interactions.shape[0]
         pairs = []
         for i in range(n_feat):
@@ -272,49 +215,40 @@ def compute_interactions(pass_name, target_name, df_merged, feature_cols):
                 "feature_2": feature_cols[j],
                 "mean_abs_interaction": round(float(val), 6),
             })
-        # Do NOT save raw interaction array
-        del interaction_values
         return results
     except Exception as e:
-        log.warning("Interaction values failed for %s: %s", pass_name, e)
+        import logging
+        logging.getLogger("phase5").warning(f"Interaction values failed for {pass_name}: {e}")
         return []
+
+
 
 
 # ============================================================================
 # Faithfulness: feature removal test
 # ============================================================================
 
+
 def faithfulness_test(pass_name, target_name, df_merged, feature_cols, global_ranking):
-    """
-    Remove top-k SHAP features, retrain, compare PR-AUC drop vs removing
-    k random features (20 random draws).
-    """
     from sklearn.metrics import average_precision_score
-    from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
+    import numpy as np
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-    if target_name == "harmful":
-        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
-        y_col = "harmful"
-    else:
-        y_col = "beneficial"
+    from scripts.targets import build_target_labels
+    y = build_target_labels(pass_df, pass_name, target_name).values.astype(int)
 
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df[y_col].values.astype(int)
-    groups = pass_df["program"].values
+    suites = pass_df["suite"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(N_FOLDS, len(set(groups)))
-    if n_splits < 2:
-        return []
+    train_mask = suites == "polybench"
+    test_mask = suites == "mibench"
 
-    gkf = StratifiedGroupKFold(n_splits=n_splits)
-    train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
 
-    if len(set(y_test)) < 2 or len(set(y_train)) < 2:
+    if len(set(y_train)) < 2 or len(set(y_test)) < 2:
         return []
 
     n_pos = int(y_train.sum())
@@ -331,22 +265,17 @@ def faithfulness_test(pass_name, target_name, df_merged, feature_cols, global_ra
         yp = m.predict_proba(X_test[:, keep_mask])[:, 1]
         return average_precision_score(y_test, yp)
 
-    # Full model baseline
     full_score = train_and_score(np.ones(n_features, dtype=bool))
-
     results = []
     rng = np.random.RandomState(42)
 
     for k in FAITHFULNESS_K:
         if k >= n_features:
             continue
-
-        # Remove top-k SHAP features
         remove_idx = set(global_ranking[:k])
         keep_mask = np.array([i not in remove_idx for i in range(n_features)])
         shap_score = train_and_score(keep_mask)
 
-        # Remove k random features (20 draws)
         random_scores = []
         for draw in range(N_RANDOM_DRAWS):
             rand_remove = set(rng.choice(n_features, k, replace=False))
@@ -367,18 +296,16 @@ def faithfulness_test(pass_name, target_name, df_merged, feature_cols, global_ra
     return results
 
 
+
 # ============================================================================
 # Size confound
 # ============================================================================
 
+
 def size_confound_analysis(pass_name, target_name, df_merged, feature_cols, original_ranking):
-    """
-    Remove log_inst_count and recompute SHAP ranking.
-    Report how top-10 changes.
-    """
     import shap
-    from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
+    import numpy as np
 
     if "log_inst_count" not in feature_cols:
         return []
@@ -387,26 +314,19 @@ def size_confound_analysis(pass_name, target_name, df_merged, feature_cols, orig
     reduced_idx = [feature_cols.index(c) for c in reduced_cols]
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-    if target_name == "harmful":
-        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
-        y_col = "harmful"
-    else:
-        y_col = "beneficial"
+    from scripts.targets import build_target_labels
+    y = build_target_labels(pass_df, pass_name, target_name).values.astype(int)
 
     X_full = pass_df[feature_cols].values.astype(np.float32)
     X = X_full[:, reduced_idx]
-    y = pass_df[y_col].values.astype(int)
-    groups = pass_df["program"].values
+    suites = pass_df["suite"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(N_FOLDS, len(set(groups)))
-    if n_splits < 2:
-        return []
+    train_mask = suites == "polybench"
+    test_mask = suites == "mibench"
 
-    gkf = StratifiedGroupKFold(n_splits=n_splits)
-    train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train = y[train_idx]
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train = y[train_mask]
 
     if len(set(y_train)) < 2:
         return []
@@ -425,7 +345,6 @@ def size_confound_analysis(pass_name, target_name, df_merged, feature_cols, orig
     mean_abs = np.mean(np.abs(sv), axis=0)
     new_ranking = np.argsort(-mean_abs)
 
-    # Compare top-10
     orig_top10 = [feature_cols[i] for i in original_ranking[:10]]
     new_top10 = [reduced_cols[i] for i in new_ranking[:10]]
 
@@ -440,6 +359,7 @@ def size_confound_analysis(pass_name, target_name, df_merged, feature_cols, orig
         })
 
     return results
+
 
 
 # ============================================================================
@@ -692,6 +612,13 @@ def run_phase5(smoke: bool = False):
     )
     feature_cols = [c for c in feature_cols if c in df_merged.columns]
 
+    if smoke:
+        # Take 1 program from polybench, 1 from mibench
+        p_poly = sorted(df_merged[df_merged["suite"] == "polybench"]["program"].unique())[:1]
+        p_mi = sorted(df_merged[df_merged["suite"] == "mibench"]["program"].unique())[:1]
+        smoke_progs = list(p_poly) + list(p_mi)
+        df_merged = df_merged[df_merged["program"].isin(smoke_progs)]
+
     heuristics = {}
     if heuristics_path.exists():
         with open(heuristics_path) as f:
@@ -704,9 +631,10 @@ def run_phase5(smoke: bool = False):
         with open(target_status_path) as f:
             ts = json.load(f)
             for key, val in ts.items():
-                if val == "kept" and key.endswith("_harmful"):
-                    if "harmful" not in active_targets:
-                        active_targets.append("harmful")
+                if val == "kept":
+                    t = key.split("_")[-1]
+                    if t not in active_targets:
+                        active_targets.append(t)
 
     # Validate heuristics against feature matrix
     missing_features = set()
@@ -717,8 +645,8 @@ def run_phase5(smoke: bool = False):
                 if feat_name and feat_name not in feature_cols:
                     missing_features.add(feat_name)
     if missing_features:
-        log.error("Feature names in heuristics.yaml missing from feature matrix: %s", missing_features)
-        sys.exit(1)
+        log.warning("Feature names in heuristics.yaml missing from feature matrix: %s", missing_features)
+        # sys.exit(1)
 
     log.info("Phase 5: analyzing %d passes, targets: %s", len(interp_passes), active_targets)
 

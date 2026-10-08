@@ -1,7 +1,7 @@
 ; ModuleID = 'loop_sum'
 ; A function with a counted loop summing array elements.
-; Expected: 11 instructions, 3 BBs (entry, loop, exit), 1 loop depth 1,
-;           2 phi nodes, 1 load, 1 GEP, 2 int_arith, 1 icmp, 2 cond/uncond br.
+; Expected: 10 instructions, 3 BBs (entry, loop, exit), 1 loop depth 1,
+;           2 phi nodes, 1 load, 1 GEP, 2 int_arith, 1 icmp, 1 cond br, 1 uncond br.
 
 define i32 @loop_sum(ptr %arr, i32 %n) {
 entry:

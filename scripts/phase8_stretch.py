@@ -254,7 +254,7 @@ def run_polybench_runtime_study(tools: dict):
 # Main
 # ============================================================================
 
-def run_phase8():
+def run_phase8(smoke: bool = False):
     """Execute all Stretch goals."""
     ensure_dirs()
     import pandas as pd
@@ -278,6 +278,12 @@ def run_phase8():
             
         df_merged = pd.merge(df_labels, df_features, on=["ir_hash", "suite", "program", "function"], how="inner")
         
+        if smoke:
+            p_poly = sorted(df_merged[df_merged["suite"] == "polybench"]["program"].unique())[:1]
+            p_mi = sorted(df_merged[df_merged["suite"] == "mibench"]["program"].unique())[:1]
+            smoke_progs = list(p_poly) + list(p_mi)
+            df_merged = df_merged[df_merged["program"].isin(smoke_progs)]
+            
         distill_to_decision_tree(df_merged, feature_cols, kept_passes)
     else:
         log.warning("Required files for Distillation not found. Skipping Stretch 1.")

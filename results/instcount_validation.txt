@@ -1,0 +1,8 @@
+Check: (reachable instructions, reachable basic blocks) from our
+text parser versus LLVM's print<func-properties>
+(TotalInstructionCount, BasicBlockCount), for every function.
+
+Functions checked: 3578
+Mismatches:        0
+Functions that also contain unreachable blocks: 1
+(labels count ALL instructions in the IR, including those blocks)

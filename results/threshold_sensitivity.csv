@@ -1,22 +1,49 @@
 pass_name,threshold,pos_rate,n_samples,top5_shap
-instcombine,0.005,0.875,40,log_inst_count; load_density; gep_density; const_operands_density; icmp_density
-simplifycfg,0.005,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
-early-cse,0.005,0.65,40,gep_density; icmp_density; const_operands_density; int_arith_density; log_inst_count
-gvn,0.005,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
-jump-threading,0.005,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
-loop-rotate,0.005,0.0,40,N/A
-indvars,0.005,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
-instcombine,0.01,0.875,40,log_inst_count; load_density; gep_density; const_operands_density; icmp_density
-simplifycfg,0.01,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
-early-cse,0.01,0.575,40,int_arith_density; const_operands_density; icmp_density; cast_density; log_inst_count
-gvn,0.01,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
-jump-threading,0.01,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
-loop-rotate,0.01,0.0,40,N/A
-indvars,0.01,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
-instcombine,0.02,0.675,40,int_arith_density; icmp_density; log_inst_count; fp_arith_density; fcmp_density
-simplifycfg,0.02,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
-early-cse,0.02,0.55,40,int_arith_density; icmp_density; load_density; log_inst_count; const_operands_density
-gvn,0.02,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
-jump-threading,0.02,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
-loop-rotate,0.02,0.0,40,N/A
-indvars,0.02,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+instcombine,0.005,0.726,2953,log_inst_count; gep_density; cast_density; phi_density; icmp_density
+simplifycfg,0.005,0.6959,2953,uncond_br_density; blocks_1_pred_density; log_inst_count; max_insts_per_bb; blocks_2_pred_density
+early-cse,0.005,0.6871,2953,gep_density; cast_density; log_inst_count; const_operands_density; ret_density
+gvn,0.005,0.7616,2953,gep_density; log_inst_count; cast_density; blocks_1_pred_density; loop_count_density
+sccp,0.005,0.0366,2953,N/A
+adce,0.005,0.0765,2953,select_density; call_density; log_inst_count; const_operands_density; cast_density
+reassociate,0.005,0.0962,2953,select_density; int_arith_density; log_inst_count; loop_count_density; cast_density
+jump-threading,0.005,0.6299,2953,uncond_br_density; blocks_1_pred_density; loop_count_density; log_inst_count; max_insts_per_bb
+correlated-propagation,0.005,0.1422,2953,phi_density; phi_args_total_density; log_inst_count; loop_count_density; int_arith_density
+licm,0.005,0.0447,2953,N/A
+loop-rotate,0.005,0.0928,2953,loop_count_density; load_density; const_operands_density; store_density; phi_args_total_density
+indvars,0.005,0.1839,2953,loop_count_density; cast_density; ret_density; gep_density; phi_density
+loop-deletion,0.005,0.0017,2953,N/A
+loop-idiom,0.005,0.0,2953,N/A
+loop-unroll,0.005,0.0007,2953,N/A
+tailcallelim,0.005,0.0,2953,N/A
+instcombine,0.01,0.7193,2953,log_inst_count; gep_density; cast_density; phi_density; ret_density
+simplifycfg,0.01,0.6837,2953,uncond_br_density; blocks_1_pred_density; log_inst_count; max_insts_per_bb; blocks_2_pred_density
+early-cse,0.01,0.681,2953,gep_density; cast_density; phi_density; log_inst_count; store_density
+gvn,0.01,0.7565,2953,gep_density; ret_density; blocks_1_pred_density; cast_density; cond_br_density
+sccp,0.01,0.0308,2953,N/A
+adce,0.01,0.0596,2953,select_density; cast_density; store_density; phi_density; loop_count_density
+reassociate,0.01,0.0694,2953,select_density; int_arith_density; cast_density; max_insts_per_bb; call_density
+jump-threading,0.01,0.6153,2953,uncond_br_density; blocks_1_pred_density; loop_count_density; max_insts_per_bb; call_density
+correlated-propagation,0.01,0.1216,2953,phi_density; phi_args_total_density; loop_count_density; int_arith_density; log_inst_count
+licm,0.01,0.0342,2953,N/A
+loop-rotate,0.01,0.0799,2953,loop_count_density; load_density; const_operands_density; gep_density; phi_args_total_density
+indvars,0.01,0.169,2953,loop_count_density; cast_density; gep_density; store_density; ret_density
+loop-deletion,0.01,0.0017,2953,N/A
+loop-idiom,0.01,0.0,2953,N/A
+loop-unroll,0.01,0.0007,2953,N/A
+tailcallelim,0.01,0.0,2953,N/A
+instcombine,0.02,0.6837,2953,gep_density; cast_density; phi_density; log_inst_count; const_operands_density
+simplifycfg,0.02,0.6434,2953,uncond_br_density; blocks_1_pred_density; loop_count_density; max_insts_per_bb; log_inst_count
+early-cse,0.02,0.6566,2953,gep_density; cast_density; const_operands_density; int_arith_density; store_density
+gvn,0.02,0.7315,2953,gep_density; blocks_1_pred_density; cast_density; log_inst_count; blocks_2_pred_density
+sccp,0.02,0.019,2953,N/A
+adce,0.02,0.0308,2953,N/A
+reassociate,0.02,0.0369,2953,N/A
+jump-threading,0.02,0.5645,2953,uncond_br_density; loop_count_density; blocks_1_pred_density; call_density; max_insts_per_bb
+correlated-propagation,0.02,0.087,2953,phi_density; phi_args_total_density; loop_count_density; int_arith_density; blocks_2_pred_density
+licm,0.02,0.0213,2953,N/A
+loop-rotate,0.02,0.0562,2953,loop_count_density; load_density; gep_density; call_density; const_operands_density
+indvars,0.02,0.1351,2953,loop_count_density; cast_density; gep_density; const_operands_density; innermost_loop_body_size
+loop-deletion,0.02,0.0014,2953,N/A
+loop-idiom,0.02,0.0,2953,N/A
+loop-unroll,0.02,0.0007,2953,N/A
+tailcallelim,0.02,0.0,2953,N/A

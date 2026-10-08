@@ -1,65 +1,105 @@
 #!/usr/bin/env python3
 """
-phase1_setup_data.py — Download benchmarks, compile to IR, extract functions.
+phase1_setup_data.py — Fetch benchmarks, compile to IR, extract functions.
 
 Pipeline:
-  1. Download PolyBench/C 4.2.1 and MiBench from GitHub.
-  2. Find all .c files, compile each to LLVM IR with:
-       clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S -o out.ll in.c
-  3. Run mem2reg on each IR file to get a clean baseline:
-       opt -passes=mem2reg -S -o out.ll in.ll
-  4. Extract each defined function into its own .ll module using llvm-extract.
-  5. Drop functions with fewer than 10 instructions.
-  6. Deduplicate by SHA256 hash of normalized IR.
-  7. Log every compilation failure to data/compile_errors.log.
+  1. Fetch PolyBench/C 4.2.1 and MiBench (pinned commits, see SOURCES below).
+  2. Compile every .c file to LLVM IR:
+       clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S -w -I<dirs> in.c
+     with -I for every directory that holds headers inside the SAME benchmark.
+     If that fails, retry ONCE in a legacy C dialect (-std=gnu89 and the
+     pre-clang-16 behaviour for implicit declarations), because MiBench is
+     pre-C99 code.  Which mode was used is recorded per function.
+  3. Run mem2reg to get the baseline IR.
+  4. Extract every defined function into its own module (llvm-extract).
+  5. Cross-check our instruction counter against LLVM's own count.
+  6. Drop functions with fewer than 10 instructions.
+  7. Deduplicate by hash of the normalized function body.
+  8. Cap each benchmark program at N functions (seeded sample).
+  9. Write the selected baseline IR files and the function index.
+
+Nothing from the benchmarks is ever executed; files are only compiled.
 
 Output:
-  data/ir/<suite>/<program>/<function_name>.ll  — one function per file
-  data/function_index.csv — columns: suite, program, function, path, ir_hash,
-                            inst_count, is_duplicate
+  data/ir/<suite>/<program>/<id>.ll   one baseline function per file
+  data/function_index.csv             one row per selected function
+  data/manifest.csv                   same table (small, safe to commit)
+  data/SOURCES.md                     where the benchmark sources came from
+  results/compile_failures.csv        every file that failed, with the reason
+  results/instcount_validation.txt    our counter vs LLVM's counter
+  results/phase1_gate.txt             gate report
 
 Usage:
-  python -m scripts.phase1_setup_data [--smoke]
+  python -m scripts.phase1_setup_data [--smoke] [--jobs N] [--cap N]
 """
 
 import argparse
 import csv
 import hashlib
-import os
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
+import time
 import urllib.request
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.utils import (
     PROJECT_ROOT, DATA_DIR, RAW_DIR, IR_DIR, RESULTS_DIR,
-    ensure_dirs, find_llvm_tools, run_tool,
-    normalize_ir, hash_ir, count_instructions,
+    ensure_dirs, find_llvm_tools, require_pinned_llvm, run_tool,
+    hash_ir, count_instructions,
     setup_logging, SMOKE_PROGRAMS,
 )
+from scripts.phase2_features import reachable_counts
 
 log = setup_logging("phase1")
 
 # ============================================================================
-# Source URLs
+# Benchmark sources (pinned to exact commits so every run sees the same code)
 # ============================================================================
 
-POLYBENCH_URL = "https://github.com/MatthiasJReisinger/PolyBenchC-4.2.1/archive/refs/heads/master.tar.gz"
-POLYBENCH_FALLBACK_URL = "https://downloads.sourceforge.net/project/polybench/polybench-c-4.2.1.tar.gz"
+SOURCES = {
+    "polybench": {
+        "repo": "https://github.com/MatthiasJReisinger/PolyBenchC-4.2.1",
+        "commit": "3e872547cef7e5c9909422ef1e6af03cf4e56072",
+    },
+    "mibench": {
+        "repo": "https://github.com/embecosm/mibench",
+        "commit": "0f3cbcf6b3d589a2b0753cfb9289ddf40b6b9ed8",
+    },
+}
 
-MIBENCH_URL = "https://github.com/embecosm/mibench/archive/refs/heads/master.tar.gz"
+# ============================================================================
+# Configuration
+# ============================================================================
 
-# AnghaBench (used only if unique function count < 1000)
-ANGHABENCH_URL = "https://github.com/brenocfg/AnghaBench/archive/refs/heads/master.tar.gz"
-ANGHABENCH_CAP = 500  # max number of .c files to take from AnghaBench
+MIN_INSTRUCTIONS = 10          # drop functions smaller than this
+DEFAULT_CAP = 100              # max functions per benchmark program
+ESCALATED_CAP = 200            # used only if DEFAULT_CAP gives < MIN_UNIQUE
+MIN_UNIQUE_FUNCTIONS = 1000    # Phase 1 gate
+SAMPLE_SEED = 42               # seed for the per-program sample
+COMPILE_TIMEOUT = 60           # seconds per clang call
+
+# Flags for the first compile attempt
+BASE_FLAGS = ["-O0", "-Xclang", "-disable-O0-optnone", "-emit-llvm", "-S", "-w"]
+
+# Extra flags for the single retry.  clang 16+ turned several old-C habits
+# into hard errors; these flags restore the older behaviour (warnings).
+LEGACY_C_FLAGS = [
+    "-std=gnu89",
+    "-Wno-error=implicit-function-declaration",
+    "-Wno-error=implicit-int",
+    "-Wno-error=int-conversion",
+    "-Wno-error=incompatible-function-pointer-types",
+    "-Wno-error=incompatible-pointer-types",
+    "-Wno-error=return-type",
+]
 
 
 # ============================================================================
@@ -74,7 +114,7 @@ def download_file(url: str, dest: Path, label: str = "") -> bool:
     log.info("Downloading %s from %s ...", label or dest.name, url)
     # Use urllib to avoid extra dependencies
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         dest.parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as f:
             shutil.copyfileobj(resp, f)
@@ -82,502 +122,538 @@ def download_file(url: str, dest: Path, label: str = "") -> bool:
     return True
 
 
-def extract_tarball(tarball: Path, dest_dir: Path):
-    """Extract a .tar.gz file into dest_dir."""
-    if not tarball.exists():
-        raise FileNotFoundError(f"Tarball not found: {tarball}")
+def fetch_suite(suite: str) -> Path:
+    """
+    Make sure data/raw/<suite> exists and return its path.
+    If the folder is already there (from an earlier run or a manual copy),
+    it is used as it is.  Otherwise the pinned commit is downloaded.
+    """
+    suite_dir = RAW_DIR / suite
+    if suite_dir.exists():
+        log.info("Using existing sources: %s", suite_dir)
+        return suite_dir
+
+    info = SOURCES[suite]
+    url = f"{info['repo']}/archive/{info['commit']}.tar.gz"
+    tarball = RAW_DIR / f"{suite}-{info['commit'][:12]}.tar.gz"
+    download_file(url, tarball, suite)
+
+    # Extract into a temporary folder, then rename the single top-level
+    # folder inside the archive to data/raw/<suite>
+    tmp_dir = RAW_DIR / f"_{suite}_extract"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
     log.info("Extracting %s ...", tarball.name)
     with tarfile.open(tarball, "r:gz") as tf:
-        tf.extractall(dest_dir)
-    log.info("Extracted to %s", dest_dir)
+        tf.extractall(tmp_dir)
+    top_level = [d for d in tmp_dir.iterdir() if d.is_dir()]
+    if len(top_level) != 1:
+        raise RuntimeError(f"Unexpected archive layout in {tarball}: {top_level}")
+    top_level[0].rename(suite_dir)
+    tmp_dir.rmdir()
+    tarball.unlink()   # the archive is no longer needed (saves disk space)
+    return suite_dir
+
+
+def write_sources_md():
+    """Record where the benchmark sources came from."""
+    lines = ["# Benchmark sources", "",
+             "Fetched by `scripts/phase1_setup_data.py`. The sources themselves",
+             "are not part of this repository (each suite has its own license).",
+             ""]
+    for suite, info in SOURCES.items():
+        lines.append(f"- **{suite}**: {info['repo']} at commit `{info['commit']}`")
+    (DATA_DIR / "SOURCES.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ============================================================================
 # Benchmark discovery
 # ============================================================================
 
-def find_c_files(root: Path, suite: str, smoke: bool = False) -> List[Tuple[str, str, Path]]:
+def find_c_files(suite: str, suite_dir: Path, smoke: bool = False) -> List[dict]:
     """
-    Find all .c files under root, returning (suite, program_name, path) tuples.
-    Skips utility/header files (polybench.c, etc.).
+    Find every .c file of a suite.  Returns a list of dicts:
+      suite, program, c_file (Path), rel_path (str), include_dirs (list)
+
+    "program" is the benchmark program the file belongs to.  It is the
+    grouping unit for cross-validation, so files of one benchmark must
+    never be split across two program names.
+      PolyBench: the kernel folder                  (e.g. "2mm")
+      MiBench:   <category>/<benchmark> -> benchmark (e.g. "ghostscript")
     """
-    skip_names = {"polybench.c", "polybench.h", "Makefile"}
-    results = []
+    entries = []
 
-    for c_file in sorted(root.rglob("*.c")):
-        # Skip utility files
-        if c_file.name in skip_names:
+    for c_file in sorted(suite_dir.rglob("*.c")):
+        rel = c_file.relative_to(suite_dir)
+        parts = rel.parts
+        if ".git" in parts:
             continue
-        # Skip test harnesses and makefiles
-        if "utilities" in str(c_file) or "common" in str(c_file):
-            continue
-        # Derive program name from parent directory
-        prog_dir = c_file.parent
-        program = prog_dir.name
-        if program == "src":
-            prog_dir = prog_dir.parent
-            program = prog_dir.name
-        # In smoke mode, only process SMOKE_PROGRAMS
-        if smoke and not any(sp in program for sp in SMOKE_PROGRAMS):
-            continue
-        results.append((suite, program, c_file, prog_dir))
 
-    log.info("Found %d .c files in %s%s", len(results), suite,
+        if suite == "polybench":
+            # utilities/ holds the shared harness (polybench.c) and a
+            # template file; they are not benchmark kernels.
+            if parts[0] == "utilities":
+                continue
+            program = c_file.parent.name
+            benchmark_root = c_file.parent
+            extra_include_roots = [suite_dir / "utilities"]
+        else:
+            # MiBench layout: <category>/<benchmark>/.../file.c
+            if len(parts) < 3:
+                continue
+            program = parts[1]
+            benchmark_root = suite_dir / parts[0] / parts[1]
+            extra_include_roots = []
+
+        if smoke and program not in SMOKE_PROGRAMS:
+            continue
+
+        # Include path: the file's own folder first, then every folder
+        # inside the same benchmark that contains at least one header.
+        header_dirs = sorted(set(h.parent for h in benchmark_root.rglob("*.h")))
+        include_dirs = [c_file.parent]
+        for d in header_dirs + extra_include_roots:
+            if d not in include_dirs:
+                include_dirs.append(d)
+
+        entries.append({
+            "suite": suite,
+            "program": program,
+            "c_file": c_file,
+            "rel_path": rel.as_posix(),
+            "include_dirs": include_dirs,
+        })
+
+    log.info("Found %d .c files in %s%s", len(entries), suite,
              " (smoke mode)" if smoke else "")
-    return results
+    return entries
 
 
 # ============================================================================
 # Compilation pipeline
 # ============================================================================
 
-def compile_to_ir(c_file: Path, output_ll: Path, tools: dict,
-                  include_dirs: List[Path] = None) -> bool:
+def first_error_line(stderr_text: str) -> str:
+    """Return the first compiler error message, shortened, for the failure log."""
+    for line in stderr_text.splitlines():
+        if "error:" in line:
+            message = line.split("error:", 1)[1].strip()
+            return message[:160]
+    stripped = stderr_text.strip().splitlines()
+    return stripped[0][:160] if stripped else "unknown error"
+
+
+def compile_to_ir(c_file: Path, include_dirs: List[Path], tools: dict,
+                  legacy: bool) -> Tuple[Optional[str], str]:
     """
-    Compile a C file to LLVM IR:
-      clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S -o output.ll input.c
-    Returns True on success, False on failure (logged).
+    Compile one C file to LLVM IR text (written to stdout, not to disk).
+    Returns (ir_text, "") on success or (None, reason) on failure.
     """
-    cmd = [
-        tools["clang"],
-        "-O0", "-Xclang", "-disable-O0-optnone",
-        "-emit-llvm", "-S",
-        "-w",  # suppress warnings
-    ]
-    # Add include directories (PolyBench needs its utilities/ dir)
-    if include_dirs:
-        for inc in include_dirs:
-            cmd.extend(["-I", str(inc)])
-    cmd.extend(["-o", str(output_ll), str(c_file)])
+    cmd = [tools["clang"]] + BASE_FLAGS
+    if legacy:
+        cmd += LEGACY_C_FLAGS
+    for inc in include_dirs:
+        cmd += ["-I", str(inc)]
+    cmd += ["-o", "-", str(c_file)]
 
     try:
-        run_tool(cmd, timeout=30, check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        result = run_tool(cmd, timeout=COMPILE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {COMPILE_TIMEOUT}s"
+    if result.returncode != 0:
+        return None, first_error_line(result.stderr)
+    return result.stdout, ""
 
 
-def run_mem2reg(input_ll: Path, output_ll: Path, tools: dict) -> bool:
-    """Run mem2reg pass to promote allocas to SSA registers."""
-    cmd = [
-        tools["opt"],
-        "-passes=mem2reg",
-        "-S",
-        "-o", str(output_ll),
-        str(input_ll),
-    ]
+def run_mem2reg(ir_text: str, tools: dict) -> Tuple[Optional[str], str]:
+    """Run mem2reg (promote allocas to SSA registers) on IR text."""
+    cmd = [tools["opt"], "-passes=mem2reg", "-S"]
     try:
-        run_tool(cmd, timeout=30, check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        result = run_tool(cmd, timeout=COMPILE_TIMEOUT, check=False, input_data=ir_text)
+    except subprocess.TimeoutExpired:
+        return None, f"mem2reg timeout after {COMPILE_TIMEOUT}s"
+    if result.returncode != 0:
+        return None, "mem2reg: " + first_error_line(result.stderr)
+    return result.stdout, ""
 
 
-def extract_function_names(ll_file: Path) -> List[str]:
+def extract_function_names(ir_text: str) -> List[str]:
     """
-    Parse an .ll file and return the names of all defined (non-declaration) functions.
+    Return the names of all defined (non-declaration) functions.
     Looks for lines like: define ... @function_name(...)
     """
     names = []
-    text = ll_file.read_text(encoding="utf-8", errors="replace")
-    # Match function definitions (not declarations)
-    for match in re.finditer(r"^define\s+.*?@([a-zA-Z_.$][a-zA-Z0-9_.$]*)\s*\(", text, re.MULTILINE):
+    for match in re.finditer(r"^define\s+.*?@([a-zA-Z_.$][a-zA-Z0-9_.$]*)\s*\(",
+                             ir_text, re.MULTILINE):
         names.append(match.group(1))
     return names
 
 
-def extract_single_function(ll_file: Path, func_name: str,
-                             output_ll: Path, tools: dict) -> bool:
+def extract_single_function(module_ir: str, func_name: str, tools: dict) -> Optional[str]:
     """
-    Extract a single function from an .ll module using llvm-extract.
-    Falls back to manual extraction if llvm-extract fails.
+    Extract one function from a module with llvm-extract.
+    Returns the IR text of a module that contains only that definition
+    (everything it calls becomes a declaration), or None on failure.
     """
-    cmd = [
-        tools["llvm-extract"],
-        "--func", func_name,
-        "-S",
-        "-o", str(output_ll),
-        str(ll_file),
-    ]
+    cmd = [tools["llvm-extract"], "--func", func_name, "-S", "-o", "-", "-"]
     try:
-        run_tool(cmd, timeout=15, check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        result = run_tool(cmd, timeout=30, check=False, input_data=module_ir)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
-def _manual_extract_function(ll_file: Path, func_name: str, output_ll: Path) -> bool:
+def llvm_instruction_counts(module_ir: str, tools: dict) -> Dict[str, Tuple[int, int]]:
     """
-    Fallback function extraction: read the .ll file and extract the function
-    definition for func_name, including any necessary type definitions and
-    declarations.
+    Ask LLVM itself how many instructions and basic blocks each function has.
+    Returns {function_name: (TotalInstructionCount, BasicBlockCount)}.
+    Used only to validate our text-based counter.
     """
-    try:
-        text = ll_file.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
+    cmd = [tools["opt"], "-passes=print<func-properties>", "-disable-output"]
+    result = run_tool(cmd, timeout=COMPILE_TIMEOUT, check=True, input_data=module_ir)
+    counts = {}
+    current = None
+    bb = None
+    for line in (result.stderr + result.stdout).splitlines():
+        match = re.match(r"Printing analysis results of CFA for function '(.*)':", line)
+        if match:
+            current = match.group(1)
+            bb = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("BasicBlockCount:"):
+            bb = int(line.split(":")[1])
+        elif line.startswith("TotalInstructionCount:"):
+            counts[current] = (int(line.split(":")[1]), bb)
+    return counts
 
-        # Collect preamble (target triple, datalayout, type definitions, declarations)
-        preamble_lines = []
-        func_lines = []
-        in_target_func = False
-        brace_depth = 0
 
-        for line in lines:
-            stripped = line.strip()
+def process_one_file(entry: dict, tools: dict) -> dict:
+    """
+    Compile one C file and extract all of its functions.
+    Runs in a worker process.  Returns a dict with:
+      status         "ok" or "failed"
+      stage, reason  where and why it failed (if it failed)
+      compile_mode   "default" or "legacy_c89"
+      functions      list of dicts (function, ir_text, inst_count, ir_hash)
+      mismatches     list of counter disagreements with LLVM
+    """
+    out = {"entry": entry, "status": "failed", "stage": "", "reason": "",
+           "compile_mode": "", "functions": [], "mismatches": [],
+           "extract_failures": 0, "n_defined": 0, "with_dead_code": 0}
 
-            # Keep target info and type definitions
-            if stripped.startswith("target ") or stripped.startswith("%") or \
-               stripped.startswith("declare ") or stripped.startswith("@") or \
-               stripped.startswith("source_filename") or stripped.startswith("attributes"):
-                if not in_target_func:
-                    preamble_lines.append(line)
-                continue
+    # Step A: C -> IR (default dialect, then one legacy retry)
+    ir_text, reason = compile_to_ir(entry["c_file"], entry["include_dirs"], tools, legacy=False)
+    mode = "default"
+    if ir_text is None:
+        first_reason = reason
+        ir_text, reason = compile_to_ir(entry["c_file"], entry["include_dirs"], tools, legacy=True)
+        mode = "legacy_c89"
+        if ir_text is None:
+            out["stage"] = "compile"
+            # Report the error from the legacy attempt; it is the one that
+            # remains after old-C habits are allowed.
+            out["reason"] = reason
+            out["first_reason"] = first_reason
+            return out
+    out["compile_mode"] = mode
 
-            # Check if this is the start of our target function
-            if re.match(rf"define\s+.*@{re.escape(func_name)}\s*\(", stripped):
-                in_target_func = True
-                func_lines.append(line)
-                brace_depth += line.count("{") - line.count("}")
-                continue
+    # Step B: mem2reg
+    baseline_ir, reason = run_mem2reg(ir_text, tools)
+    if baseline_ir is None:
+        out["stage"] = "mem2reg"
+        out["reason"] = reason
+        return out
 
-            if in_target_func:
-                func_lines.append(line)
-                brace_depth += line.count("{") - line.count("}")
-                if brace_depth <= 0:
-                    break
-            # Skip other function definitions
-            elif stripped.startswith("define "):
-                continue
+    # Step C: LLVM's own counts, to validate our counter
+    llvm_counts = llvm_instruction_counts(baseline_ir, tools)
 
-        if not func_lines:
-            return False
+    # Step D: extract each defined function
+    func_names = extract_function_names(baseline_ir)
+    out["n_defined"] = len(func_names)
+    for func_name in func_names:
+        func_ir = extract_single_function(baseline_ir, func_name, tools)
+        if func_ir is None:
+            out["extract_failures"] += 1
+            continue
 
-        output_text = "\n".join(preamble_lines + [""] + func_lines) + "\n"
-        output_ll.parent.mkdir(parents=True, exist_ok=True)
-        output_ll.write_text(output_text, encoding="utf-8")
-        return True
+        inst_count = count_instructions(func_ir)
 
-    except Exception as e:
-        log.error("Manual extraction failed for %s: %s", func_name, e)
-        return False
+        # Validate our parser against LLVM (every function, not a sample).
+        # LLVM's analysis counts only blocks reachable from the entry, so
+        # we compare it with OUR reachable counts.  This checks the
+        # instruction counter, the block parser and the branch-target
+        # parser at the same time.
+        reach_insts, reach_blocks = reachable_counts(func_ir, func_name)
+        if reach_insts != inst_count:
+            out["with_dead_code"] += 1
+        if func_name in llvm_counts:
+            if llvm_counts[func_name] != (reach_insts, reach_blocks):
+                out["mismatches"].append((entry["rel_path"], func_name,
+                                          (reach_insts, reach_blocks), llvm_counts[func_name]))
+        else:
+            out["mismatches"].append((entry["rel_path"], func_name,
+                                      (reach_insts, reach_blocks), None))
+
+        if inst_count < MIN_INSTRUCTIONS:
+            continue
+
+        out["functions"].append({
+            "function": func_name,
+            "ir_text": func_ir,
+            "inst_count": inst_count,
+            "ir_hash": hash_ir(func_ir, func_name),
+        })
+
+    out["status"] = "ok"
+    return out
+
+
+# ============================================================================
+# Selection: dedup + per-program cap
+# ============================================================================
+
+def select_functions(candidates: List[dict], cap: int) -> Tuple[List[dict], int]:
+    """
+    candidates: every function with >= MIN_INSTRUCTIONS, in a fixed order.
+    Returns (selected, n_duplicates_removed).
+
+    1. Deduplicate by ir_hash over the WHOLE dataset (first one wins), so
+       the same function body can never sit in two programs.
+    2. Cap each program at `cap` functions with a seeded random sample.
+       The seed depends only on the program name, so the sample of one
+       program does not change when another program is added.
+    """
+    seen = set()
+    unique = []
+    for cand in candidates:
+        if cand["ir_hash"] in seen:
+            continue
+        seen.add(cand["ir_hash"])
+        unique.append(cand)
+    n_duplicates = len(candidates) - len(unique)
+
+    by_program = defaultdict(list)
+    for cand in unique:
+        by_program[(cand["suite"], cand["program"])].append(cand)
+
+    selected = []
+    for key in sorted(by_program):
+        funcs = by_program[key]
+        if len(funcs) > cap:
+            rng = random.Random(f"{SAMPLE_SEED}:{key[0]}:{key[1]}")
+            chosen_ids = set(rng.sample(range(len(funcs)), cap))
+            funcs = [f for i, f in enumerate(funcs) if i in chosen_ids]
+        selected.extend(funcs)
+    return selected, n_duplicates
+
+
+def safe_file_name(func_id: str) -> str:
+    """A short, unique, filesystem-safe file name for a function id."""
+    digest = hashlib.sha1(func_id.encode("utf-8")).hexdigest()[:10]
+    readable = re.sub(r"[^A-Za-z0-9_.-]", "_", func_id.split("::")[-1])[:60]
+    return f"{readable}__{digest}.ll"
 
 
 # ============================================================================
 # Main pipeline
 # ============================================================================
 
-def run_phase1(smoke: bool = False):
+def run_phase1(smoke: bool = False, n_jobs: int = 1, cap: Optional[int] = None):
     """Execute the full Phase 1 pipeline."""
+    start_time = time.time()
     ensure_dirs()
     tools = find_llvm_tools()
-    log.info("Using LLVM tools: %s", {k: v for k, v in tools.items()})
+    llvm_version = require_pinned_llvm(tools)
+    log.info("Using LLVM %s tools: %s", llvm_version, tools)
 
-    error_log_path = DATA_DIR / "compile_errors.log"
-    error_log = open(error_log_path, "w")
+    # ---- 1. Fetch benchmarks ----
+    entries = []
+    for suite in SOURCES:
+        suite_dir = fetch_suite(suite)
+        n_headers = len(list(suite_dir.rglob("*.h")))
+        log.info("%s: %d header (.h) files present", suite, n_headers)
+        entries.extend(find_c_files(suite, suite_dir, smoke))
+    write_sources_md()
+    log.info("Total C files to compile: %d", len(entries))
 
-    # ---- 1. Download benchmarks ----
-    polybench_tar = RAW_DIR / "polybench-c-4.2.1.tar.gz"
-    mibench_tar = RAW_DIR / "mibench-master.tar.gz"
+    # ---- 2. Compile + extract (one worker task per C file) ----
+    if n_jobs == 1:
+        results = [process_one_file(e, tools) for e in entries]
+    else:
+        from joblib import Parallel, delayed
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_one_file)(e, tools) for e in entries)
 
-    # Download benchmarks
-    if not download_file(POLYBENCH_URL, polybench_tar, "PolyBench/C 4.2.1"):
-        log.error("Could not download PolyBench. Please download manually to %s", polybench_tar)
-        sys.exit(1)
-
-    if not download_file(MIBENCH_URL, mibench_tar, "MiBench"):
-        log.error("Could not download MiBench. Please download manually to %s", mibench_tar)
-        sys.exit(1)
-
-    # ---- 2. Extract tarballs ----
-    polybench_dir = RAW_DIR / "polybench"
-    mibench_dir = RAW_DIR / "mibench"
-
-    if not polybench_dir.exists():
-        extract_tarball(polybench_tar, RAW_DIR)
-        # Find the extracted directory (may have various names)
-        for d in RAW_DIR.iterdir():
-            if d.is_dir() and "polybench" in d.name.lower() and d != polybench_dir:
-                d.rename(polybench_dir)
-                break
-
-    if not mibench_dir.exists():
-        extract_tarball(mibench_tar, RAW_DIR)
-        for d in RAW_DIR.iterdir():
-            if d.is_dir() and "mibench" in d.name.lower() and d != mibench_dir:
-                d.rename(mibench_dir)
-                break
-
-    # ---- 3. Find .c files ----
-    c_files = []
-    if polybench_dir.exists():
-        polybench_includes = list(polybench_dir.rglob("utilities"))
-        c_files.extend([(s, p, f, polybench_includes, pd)
-                        for s, p, f, pd in find_c_files(polybench_dir, "polybench", smoke)])
-    if mibench_dir.exists():
-        c_files.extend([(s, p, f, [], pd)
-                        for s, p, f, pd in find_c_files(mibench_dir, "mibench", smoke)])
-
-    log.info("Total C files to compile: %d", len(c_files))
-
-    # ---- 4. Compile each file to IR, run mem2reg, extract functions ----
-    all_functions = []  # list of dicts for the index CSV
-    compile_failures = 0
+    # ---- 3. Collect results in a fixed order (input order is sorted) ----
+    candidates = []
+    failures = []
+    mismatches = []
     extract_failures = 0
+    stats = defaultdict(Counter)       # suite -> counters
+    n_validated = 0
+    n_with_dead_code = 0   # functions that contain unreachable blocks
 
-    for suite, program, c_file, includes, prog_dir in c_files:
-        # Output paths
-        raw_ll = IR_DIR / suite / program / f"{c_file.stem}_raw.ll"
-        baseline_ll = IR_DIR / suite / program / f"{c_file.stem}_baseline.ll"
-        raw_ll.parent.mkdir(parents=True, exist_ok=True)
-
-        # Step A: Compile C -> IR
-        if not raw_ll.exists():
-            # Include all header directories inside the benchmark program
-            all_headers = list(prog_dir.rglob("*.h"))
-            extra_includes = list(set([h.parent for h in all_headers]))
-            combined_includes = includes + extra_includes
-
-            ok = compile_to_ir(c_file, raw_ll, tools, combined_includes)
-            if not ok:
-                compile_failures += 1
-                error_log.write(f"{suite},{c_file},COMPILE_FAIL\n")
-                log.warning("Compilation failed: %s", c_file)
-                # Also write to results/compile_failures.csv
-                with open("results/compile_failures.csv", "a") as f:
-                    f.write(f"{suite},{c_file},COMPILE_FAIL\n")
-                continue
-        
-        # Step B: mem2reg
-        if not baseline_ll.exists():
-            ok = run_mem2reg(raw_ll, baseline_ll, tools)
-            if not ok:
-                compile_failures += 1
-                error_log.write(f"{suite},{c_file},MEM2REG_FAIL\n")
-                log.warning("mem2reg failed: %s", raw_ll)
-                continue
-
-        # Step C: Extract each function
-        func_names = extract_function_names(baseline_ll)
-        for func_name in func_names:
-            func_ll = IR_DIR / suite / program / f"{func_name}.ll"
-
-            if not func_ll.exists():
-                ok = extract_single_function(baseline_ll, func_name, func_ll, tools)
-                if not ok:
-                    extract_failures += 1
-                    error_log.write(f"{suite},{baseline_ll},EXTRACT_FAIL,{func_name}\n")
-                    continue
-
-            # Read the extracted function and count instructions
-            ir_text = func_ll.read_text(encoding="utf-8", errors="replace")
-            inst_count = count_instructions(ir_text)
-            ir_h = hash_ir(ir_text)
-
-            all_functions.append({
+    for res in results:
+        entry = res["entry"]
+        suite = entry["suite"]
+        stats[suite]["files"] += 1
+        if res["status"] != "ok":
+            stats[suite]["failed"] += 1
+            failures.append({
                 "suite": suite,
-                "program": program,
-                "function": func_name,
-                "path": str(func_ll.relative_to(PROJECT_ROOT)),
-                "ir_hash": ir_h,
-                "inst_count": inst_count,
-                "is_duplicate": False,  # set later
+                "program": entry["program"],
+                "file": entry["rel_path"],
+                "stage": res["stage"],
+                "reason": res["reason"],
+            })
+            continue
+
+        stats[suite]["compiled"] += 1
+        stats[suite]["compiled_" + res["compile_mode"]] += 1
+        stats[suite]["functions_defined"] += res["n_defined"]
+        extract_failures += res["extract_failures"]
+        mismatches.extend(res["mismatches"])
+        n_validated += res["n_defined"] - res["extract_failures"]
+        n_with_dead_code += res["with_dead_code"]
+
+        for func in res["functions"]:
+            func_id = f"{suite}/{entry['rel_path']}::{func['function']}"
+            candidates.append({
+                "func_id": func_id,
+                "suite": suite,
+                "program": entry["program"],
+                "source_file": entry["rel_path"],
+                "function": func["function"],
+                "ir_hash": func["ir_hash"],
+                "inst_count": func["inst_count"],
+                "compile_mode": res["compile_mode"],
+                "ir_text": func["ir_text"],
             })
 
-    error_log.close()
+    # ---- 4. Counter validation (hard gate) ----
+    validation_path = RESULTS_DIR / "instcount_validation.txt"
+    with open(validation_path, "w", encoding="utf-8") as f:
+        f.write("Check: (reachable instructions, reachable basic blocks) from our\n")
+        f.write("text parser versus LLVM's print<func-properties>\n")
+        f.write("(TotalInstructionCount, BasicBlockCount), for every function.\n\n")
+        f.write(f"Functions checked: {n_validated}\n")
+        f.write(f"Mismatches:        {len(mismatches)}\n")
+        f.write(f"Functions that also contain unreachable blocks: {n_with_dead_code}\n")
+        f.write("(labels count ALL instructions in the IR, including those blocks)\n")
+        for rel_path, func_name, ours, llvm in mismatches[:200]:
+            f.write(f"{rel_path}::{func_name} ours={ours} llvm={llvm}\n")
+    if mismatches:
+        raise RuntimeError(
+            f"IR parser disagrees with LLVM on {len(mismatches)} of "
+            f"{n_validated} functions. See {validation_path}. Stopping.")
+    log.info("IR parser matches LLVM (instructions and blocks) on all %d functions.", n_validated)
 
-    # ---- 5. Drop functions under 10 instructions ----
-    before_filter = len(all_functions)
-    all_functions = [f for f in all_functions if f["inst_count"] >= 10]
-    log.info("Dropped %d functions with < 10 instructions (kept %d)",
-             before_filter - len(all_functions), len(all_functions))
+    # ---- 5. Dedup + cap (escalate the cap once if the gate is missed) ----
+    cap_used = cap if cap is not None else DEFAULT_CAP
+    selected, n_duplicates = select_functions(candidates, cap_used)
+    cap_note = f"{cap_used}"
+    if cap is None and not smoke and len(selected) < MIN_UNIQUE_FUNCTIONS:
+        log.warning("Only %d functions with cap %d; raising the cap to %d.",
+                    len(selected), cap_used, ESCALATED_CAP)
+        cap_at_default = len(selected)
+        cap_used = ESCALATED_CAP
+        selected, n_duplicates = select_functions(candidates, cap_used)
+        cap_note = f"{cap_used} (cap {DEFAULT_CAP} gave only {cap_at_default})"
 
-    # ---- 6. Group and Cap (max 100 per program) ----
-    grouped = {}
-    for func in all_functions:
-        grouped.setdefault(func["program"], []).append(func)
+    # ---- 6. Write the selected baseline IR files and the index ----
+    # Remove IR from earlier runs so the folder holds exactly this selection
+    if IR_DIR.exists():
+        shutil.rmtree(IR_DIR)
+    index_rows = []
+    for cand in selected:
+        ll_path = IR_DIR / cand["suite"] / cand["program"] / safe_file_name(cand["func_id"])
+        ll_path.parent.mkdir(parents=True, exist_ok=True)
+        ll_path.write_text(cand["ir_text"], encoding="utf-8")
+        index_rows.append({
+            "func_id": cand["func_id"],
+            "suite": cand["suite"],
+            "program": cand["program"],
+            "source_file": cand["source_file"],
+            "function": cand["function"],
+            "path": ll_path.relative_to(PROJECT_ROOT).as_posix(),
+            "ir_hash": cand["ir_hash"],
+            "inst_count": cand["inst_count"],
+            "compile_mode": cand["compile_mode"],
+            "is_duplicate": False,
+        })
 
-    rng = random.Random(42)
-    capped_functions = []
-    for prog, funcs in grouped.items():
-        if len(funcs) > 100:
-            funcs = rng.sample(funcs, 100)
-        capped_functions.extend(funcs)
+    fieldnames = ["func_id", "suite", "program", "source_file", "function", "path",
+                  "ir_hash", "inst_count", "compile_mode", "is_duplicate"]
+    for out_name in ("function_index.csv", "manifest.csv"):
+        with open(DATA_DIR / out_name, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(index_rows)
 
-    log.info("Capped functions to 100 per program: %d remain", len(capped_functions))
-    all_functions = capped_functions
-
-    # ---- 7. Deduplicate by IR hash ----
-    seen_hashes = set()
-    unique_functions = []
-    duplicates = 0
-    for func in all_functions:
-        if func["ir_hash"] in seen_hashes:
-            func["is_duplicate"] = True
-            duplicates += 1
-        else:
-            seen_hashes.add(func["ir_hash"])
-            func["is_duplicate"] = False
-            unique_functions.append(func)
-
-    log.info("Deduplication: %d duplicates removed, %d unique functions remain",
-             duplicates, len(unique_functions))
-
-    # ---- 7. Save function index ----
-    index_path = DATA_DIR / "function_index.csv"
-    fieldnames = ["suite", "program", "function", "path", "ir_hash",
-                  "inst_count", "is_duplicate"]
-    with open(index_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    # ---- 7. Failure log with reasons ----
+    with open(RESULTS_DIR / "compile_failures.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["suite", "program", "file", "stage", "reason"])
         writer.writeheader()
-        # Write ALL functions (including duplicates, marked)
-        for func in all_functions:
-            writer.writerow(func)
-        # Also write duplicates that were filtered
-        for func in [f for f in all_functions if f not in unique_functions and f["is_duplicate"]]:
-            writer.writerow(func)
+        writer.writerows(failures)
 
     # ---- 8. Gate report ----
-    n_programs = len(set(f["program"] for f in all_functions))
-    n_total = len(all_functions)
-    n_unique = len(unique_functions)
+    n_groups = len(set((r["suite"], r["program"]) for r in index_rows))
+    per_suite_selected = Counter(r["suite"] for r in index_rows)
+    reason_counts = Counter(f["reason"] for f in failures)
+    failed_programs = Counter((f["suite"], f["program"]) for f in failures)
 
-    report = f"""
-╔══════════════════════════════════════════════════╗
-║            PHASE 1 GATE REPORT                   ║
-╠══════════════════════════════════════════════════╣
-║ Programs processed:     {n_programs:>6}                   ║
-║ Total functions (≥10i): {n_total:>6}                   ║
-║ Unique functions:       {n_unique:>6}                   ║
-║ Duplicates removed:     {duplicates:>6}                   ║
-║ Compilation failures:   {compile_failures:>6}                   ║
-║ Extraction failures:    {extract_failures:>6}                   ║
-╚══════════════════════════════════════════════════╝
-"""
-    log.info(report)
+    lines = []
+    lines.append("PHASE 1 GATE REPORT")
+    lines.append("=" * 70)
+    lines.append(f"LLVM version:                    {llvm_version}")
+    lines.append(f"Mode:                            {'SMOKE' if smoke else 'FULL'}")
+    lines.append("")
+    lines.append(f"{'suite':<12}{'files':>7}{'compiled':>10}{'(default)':>11}"
+                 f"{'(legacy)':>10}{'failed':>8}{'selected funcs':>16}")
+    for suite in SOURCES:
+        st = stats[suite]
+        lines.append(f"{suite:<12}{st['files']:>7}{st['compiled']:>10}"
+                     f"{st['compiled_default']:>11}{st['compiled_legacy_c89']:>10}"
+                     f"{st['failed']:>8}{per_suite_selected[suite]:>16}")
+    lines.append("")
+    lines.append(f"Functions with >= {MIN_INSTRUCTIONS} instructions:   {len(candidates)}")
+    lines.append(f"Duplicates removed (same body):  {n_duplicates}")
+    lines.append(f"Cap per program:                 {cap_note}")
+    lines.append(f"Groups (benchmark programs):     {n_groups}")
+    lines.append(f"UNIQUE FUNCTIONS SELECTED:       {len(index_rows)}")
+    lines.append(f"Extraction failures:             {extract_failures}")
+    lines.append(f"Counter vs LLVM mismatches:      {len(mismatches)} of {n_validated}")
+    lines.append("")
+    lines.append("Most common reasons among files that still fail:")
+    for reason, count in reason_counts.most_common(5):
+        lines.append(f"  {count:>4}  {reason}")
+    lines.append("")
+    lines.append("Failed files per program:")
+    for (suite, program), count in failed_programs.most_common():
+        lines.append(f"  {count:>4}  {suite}/{program}")
+    lines.append("")
+    lines.append("Selected functions per program (10 largest):")
+    per_program = Counter((r["suite"], r["program"]) for r in index_rows)
+    for (suite, program), count in per_program.most_common(10):
+        lines.append(f"  {count:>4}  {suite}/{program}")
+    lines.append("")
+    lines.append(f"Phase 1 run time: {time.time() - start_time:.0f} s")
+    report = "\n".join(lines) + "\n"
+    log.info("\n%s", report)
+    (RESULTS_DIR / "phase1_gate.txt").write_text(report, encoding="utf-8")
 
-    # Save gate report
-    gate_path = RESULTS_DIR / "phase1_gate.txt"
-    gate_path.parent.mkdir(parents=True, exist_ok=True)
-    gate_path.write_text(report, encoding='utf-8')
+    # ---- 9. Gate ----
+    if not smoke and len(index_rows) < MIN_UNIQUE_FUNCTIONS:
+        raise RuntimeError(
+            f"Only {len(index_rows)} unique functions (< {MIN_UNIQUE_FUNCTIONS}) "
+            f"even with cap {cap_used}. Add another source before continuing.")
 
-    # ---- 9. Check if we need more functions ----
-    if n_unique < 1000 and not smoke:
-        log.error("Only %d unique functions — below 1000 threshold. Stopping.", n_unique)
-        # We will NOT download AnghaBench automatically. We will wait for user approval.
-    elif smoke:
-        log.info("Smoke mode — skipping function threshold check.")
-
-    return unique_functions
-
-
-def _supplement_with_anghabench(tools, all_functions, unique_functions,
-                                  seen_hashes, error_log_path):
-    """Download AnghaBench and add up to ANGHABENCH_CAP files."""
-    angha_tar = RAW_DIR / "anghabench-master.tar.gz"
-    
-    # AnghaBench is very large — only download a partial archive or clone shallow
-    log.info("Downloading AnghaBench (this may be large)...")
-    
-    # Instead of the full repo, we'll use git sparse checkout to get only
-    # a subset, or just grab individual files via the API.
-    # For safety, let's use a shallow clone with limited depth.
-    angha_dir = RAW_DIR / "anghabench"
-    
-    if not angha_dir.exists():
-        # Try shallow clone of just the linux subdirectory
-        try:
-            # Use git sparse-checkout to limit download size
-            angha_dir.mkdir(parents=True, exist_ok=True)
-            run_tool(["git", "init", str(angha_dir)], timeout=10)
-            run_tool(["git", "-C", str(angha_dir), "remote", "add", "origin",
-                      "https://github.com/brenocfg/AnghaBench.git"], timeout=10)
-            run_tool(["git", "-C", str(angha_dir), "config", "core.sparseCheckout", "true"],
-                     timeout=10)
-            
-            # Only check out a small subset
-            sparse_file = angha_dir / ".git" / "info" / "sparse-checkout"
-            sparse_file.parent.mkdir(parents=True, exist_ok=True)
-            sparse_file.write_text("linux/net/\n")
-            
-            run_tool(["git", "-C", str(angha_dir), "pull", "--depth=1",
-                      "origin", "master"], timeout=300, check=False)
-        except Exception as e:
-            log.error("Failed to clone AnghaBench: %s", e)
-            log.warning("Proceeding without AnghaBench supplement.")
-            return
-
-    # Find .c files from AnghaBench (capped)
-    angha_c_files = sorted(angha_dir.rglob("*.c"))[:ANGHABENCH_CAP]
-    log.info("Found %d AnghaBench .c files (capped at %d)", len(angha_c_files), ANGHABENCH_CAP)
-
-    error_log = open(error_log_path, "a")
-    new_unique = 0
-
-    for c_file in angha_c_files:
-        program = c_file.stem
-        raw_ll = IR_DIR / "anghabench" / program / f"{program}_raw.ll"
-        baseline_ll = IR_DIR / "anghabench" / program / f"{program}_baseline.ll"
-        raw_ll.parent.mkdir(parents=True, exist_ok=True)
-
-        # Compile
-        if not raw_ll.exists():
-            ok = compile_to_ir(c_file, raw_ll, tools)
-            if not ok:
-                error_log.write(f"COMPILE_FAIL\t{c_file}\n")
-                continue
-
-        # mem2reg
-        if not baseline_ll.exists():
-            ok = run_mem2reg(raw_ll, baseline_ll, tools)
-            if not ok:
-                error_log.write(f"MEM2REG_FAIL\t{raw_ll}\n")
-                continue
-
-        # Extract functions
-        func_names = extract_function_names(baseline_ll)
-        for func_name in func_names:
-            func_ll = IR_DIR / "anghabench" / program / f"{func_name}.ll"
-            if not func_ll.exists():
-                ok = extract_single_function(baseline_ll, func_name, func_ll, tools)
-                if not ok:
-                    continue
-
-            ir_text = func_ll.read_text(encoding="utf-8", errors="replace")
-            inst_count = count_instructions(ir_text)
-            if inst_count < 10:
-                continue
-
-            ir_h = hash_ir(ir_text)
-            if ir_h in seen_hashes:
-                continue
-
-            seen_hashes.add(ir_h)
-            new_unique += 1
-            entry = {
-                "suite": "anghabench",
-                "program": program,
-                "function": func_name,
-                "path": str(func_ll.relative_to(PROJECT_ROOT)),
-                "ir_hash": ir_h,
-                "inst_count": inst_count,
-                "is_duplicate": False,
-            }
-            unique_functions.append(entry)
-            all_functions.append(entry)
-
-    error_log.close()
-    log.info("AnghaBench added %d new unique functions (total now: %d)",
-             new_unique, len(unique_functions))
-
-    # Update the function index CSV
-    index_path = DATA_DIR / "function_index.csv"
-    fieldnames = ["suite", "program", "function", "path", "ir_hash",
-                  "inst_count", "is_duplicate"]
-    with open(index_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for func in all_functions:
-            writer.writerow(func)
+    return index_rows
 
 
 # ============================================================================
@@ -585,11 +661,15 @@ def _supplement_with_anghabench(tools, all_functions, unique_functions,
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 1: Download benchmarks and compile to IR")
+    parser = argparse.ArgumentParser(description="Phase 1: fetch benchmarks and compile to IR")
     parser.add_argument("--smoke", action="store_true",
-                        help="Smoke test: process only 3 programs")
+                        help="Smoke test: process only 3 PolyBench programs")
+    parser.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs")
+    parser.add_argument("--cap", type=int, default=None,
+                        help=f"Max functions per program (default {DEFAULT_CAP}, "
+                             f"raised to {ESCALATED_CAP} if needed)")
     args = parser.parse_args()
-    run_phase1(smoke=args.smoke)
+    run_phase1(smoke=args.smoke, n_jobs=args.jobs, cap=args.cap)
 
 
 if __name__ == "__main__":

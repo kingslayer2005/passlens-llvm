@@ -8,7 +8,7 @@ Flags:
   --smoke    Run the full pipeline on 3 programs in <5 minutes.
   --phase N  Run only phase N (1-7).
   --force    Force re-run even if outputs exist.
-  --jobs N   Number of parallel jobs for Phase 3.
+  --jobs N   Number of parallel jobs for Phases 1 and 3.
 
 Usage:
   python run_all.py --smoke          # fast end-to-end test
@@ -61,6 +61,9 @@ def phase6_done() -> bool:
 def phase7_done() -> bool:
     return (RESULTS_DIR / "phase7_sequence.csv").exists()
 
+def phase8_done() -> bool:
+    return (RESULTS_DIR / "stretch_distillation.csv").exists()
+
 PHASE_CHECKS = {
     1: phase1_done,
     2: phase2_done,
@@ -69,6 +72,7 @@ PHASE_CHECKS = {
     5: phase5_done,
     6: phase6_done,
     7: phase7_done,
+    8: phase8_done,
 }
 
 
@@ -100,7 +104,7 @@ def run_phase(phase_num: int, smoke: bool = False, force: bool = False,
     try:
         if phase_num == 1:
             from scripts.phase1_setup_data import run_phase1
-            run_phase1(smoke=smoke)
+            run_phase1(smoke=smoke, n_jobs=n_jobs)
 
         elif phase_num == 2:
             from scripts.phase2_features import run_phase2
@@ -108,7 +112,7 @@ def run_phase(phase_num: int, smoke: bool = False, force: bool = False,
 
         elif phase_num == 3:
             from scripts.phase3_labels import run_phase3
-            run_phase3(smoke=smoke, n_jobs=n_jobs)
+            run_phase3(smoke=smoke, n_jobs=n_jobs, force=force)
 
         elif phase_num == 4:
             from scripts.phase4_models import run_phase4
@@ -125,6 +129,10 @@ def run_phase(phase_num: int, smoke: bool = False, force: bool = False,
         elif phase_num == 7:
             from scripts.phase7_sequence import run_phase7
             run_phase7(smoke=smoke)
+
+        elif phase_num == 8:
+            from scripts.phase8_stretch import run_phase8
+            run_phase8(smoke=smoke)
 
         else:
             log.error("Unknown phase: %d", phase_num)
@@ -160,8 +168,8 @@ Examples:
     )
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke test: process only 3 programs, <5 min target")
-    parser.add_argument("--phase", type=int, choices=range(1, 8),
-                        help="Run only the specified phase (1-7)")
+    parser.add_argument("--phase", type=int, choices=range(1, 9),
+                        help="Run only the specified phase (1-8)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-run even if outputs exist")
     parser.add_argument("--jobs", type=int, default=1,
@@ -229,7 +237,7 @@ Examples:
             sys.exit(1)
     else:
         # Run all phases in order
-        for phase_num in range(1, 8):
+        for phase_num in range(1, 9):
             success = run_phase(phase_num, smoke=args.smoke, force=args.force,
                                 n_jobs=args.jobs)
             if not success:

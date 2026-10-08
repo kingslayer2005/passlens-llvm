@@ -1,11 +1,53 @@
+PHASE 1 GATE REPORT
+======================================================================
+LLVM version:                    17.0.6
+Mode:                            FULL
 
-╔══════════════════════════════════════════════════╗
-║            PHASE 1 GATE REPORT                   ║
-╠══════════════════════════════════════════════════╣
-║ Programs processed:         52                   ║
-║ Total functions (≥10i):    854                   ║
-║ Unique functions:          819                   ║
-║ Duplicates removed:         35                   ║
-║ Compilation failures:      742                   ║
-║ Extraction failures:         0                   ║
-╚══════════════════════════════════════════════════╝
+suite         files  compiled  (default)  (legacy)  failed  selected funcs
+polybench        31        30         30         0       1             107
+mibench        1087       466        359       107     621             931
+
+Functions with >= 10 instructions:   2703
+Duplicates removed (same body):  93
+Cap per program:                 100
+Groups (benchmark programs):     53
+UNIQUE FUNCTIONS SELECTED:       1038
+Extraction failures:             0
+Counter vs LLVM mismatches:      0 of 3578
+
+Most common reasons among files that still fail:
+   359  'arch.h' file not found
+    69  'jconfig.h' file not found
+    51  unknown type name 'If'
+    41  'config.h' file not found
+    13  'ad.h' file not found
+
+Failed files per program:
+   444  mibench/ghostscript
+    51  mibench/typeset
+    28  mibench/rsynth
+    26  mibench/sphinx
+    19  mibench/mad
+    18  mibench/tiff-v3.5.4
+    16  mibench/ispell
+     9  mibench/pgp
+     3  mibench/lame
+     3  mibench/adpcm
+     2  mibench/jpeg
+     1  polybench/nussinov
+     1  mibench/patricia
+     1  mibench/rijndael
+
+Selected functions per program (10 largest):
+   100  mibench/ghostscript
+   100  mibench/gsm
+   100  mibench/jpeg
+   100  mibench/lame
+   100  mibench/mad
+   100  mibench/pgp
+   100  mibench/sphinx
+   100  mibench/tiff-v3.5.4
+    24  mibench/typeset
+    19  mibench/susan
+
+Phase 1 run time: 90 s

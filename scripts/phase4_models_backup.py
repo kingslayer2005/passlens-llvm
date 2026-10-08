@@ -75,8 +75,8 @@ XGB_PARAM_SPACE = {
 
 
 def get_feature_columns(df):
-    exclude = METADATA_COLS | {"max_loop_depth", "min_loop_header_size", "max_loop_header_size"}
-    return [c for c in df.columns if c not in exclude]
+    """Return the list of feature column names (excluding metadata)."""
+    return [c for c in df.columns if c not in METADATA_COLS]
 
 
 # ============================================================================
@@ -218,9 +218,12 @@ def leakage_audit(X, y, groups, ir_hashes, pass_name, target, n_repeats, n_folds
 # Model training and evaluation
 # ============================================================================
 
-
 def train_and_evaluate_pass(pass_name, target_name, df_merged, feature_cols,
                               save_dir, audit_file):
+    """
+    Train and evaluate models for a single pass and target.
+    Returns (fold_results, xgb_prauc_vec, baseline_prauc_vecs).
+    """
     import pandas as pd
     from sklearn.dummy import DummyClassifier
     from sklearn.ensemble import RandomForestClassifier
@@ -228,132 +231,133 @@ def train_and_evaluate_pass(pass_name, target_name, df_merged, feature_cols,
     from sklearn.metrics import (
         average_precision_score, f1_score, matthews_corrcoef,
     )
+    from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
-    from scripts.targets import build_target_labels
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+
+    from scripts.targets import build_target_labels
     y_series = build_target_labels(pass_df, pass_name, target_name)
     y = y_series.values.astype(int)
 
     if len(pass_df) < 20:
+        log.warning("Too few samples for %s/%s (%d), skipping.", pass_name, target_name, len(pass_df))
         return None, None, None
 
     X = pass_df[feature_cols].values.astype(np.float32)
     groups = pass_df["program"].values
     ir_hashes = pass_df["ir_hash"].values
-    suites = pass_df["suite"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # REMOVED drop rule
-    # if pos_rate < 0.05 or pos_rate > 0.95: ...
+    pos_rate = y.mean()
+    if pos_rate < 0.05 or pos_rate > 0.95:
+        log.info("Target %s/%s pos_rate=%.2f%% — DROPPED", pass_name, target_name, pos_rate * 100)
+        return None, None, None
+
+    log.info("Pass %-25s target=%-10s samples=%d pos_rate=%.2f%%",
+             pass_name, target_name, len(y), 100 * pos_rate)
+
+    # Leakage audit
+    leakage_audit(X, y, groups, ir_hashes, pass_name, target_name,
+                  N_REPEATS, N_OUTER_FOLDS, audit_file)
 
     rng = np.random.RandomState(42)
+    n_splits = min(N_OUTER_FOLDS, len(set(groups)))
+    if n_splits < 2:
+        log.warning("Not enough groups for CV on %s/%s", pass_name, target_name)
+        return None, None, None
 
     fold_results = []
     xgb_prauc_vec = []
     baseline_vecs = {"majority": [], "logistic_regression": [], "random_forest": []}
+    best_xgb_model = None
+    best_xgb_score = -1
     skipped_file = RESULTS_DIR / "skipped_folds.txt"
 
-    # Evaluate just once: Train on polybench, Test on mibench
-    train_mask = suites == "polybench"
-    test_mask = suites == "mibench"
+    for rep in range(N_REPEATS):
+        gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
+                                     random_state=42 + rep)
 
-    X_train, X_test = X[train_mask], X[test_mask]
-    y_train, y_test = y[train_mask], y[test_mask]
-    groups_train = groups[train_mask]
-    groups_test = groups[test_mask]
-    
-    if len(set(y_test)) < 2 or len(set(y_train)) < 2:
-        return None, None, None
+        for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            groups_train = groups[train_idx]
 
-    n_pos_train = int(y_train.sum())
-    n_neg_train = len(y_train) - n_pos_train
-    spw = n_neg_train / max(n_pos_train, 1)
+            if len(set(y_test)) < 2 or len(set(y_train)) < 2:
+                msg = (f"Fold rep={rep} fold={fold_idx} pass={pass_name} "
+                       f"target={target_name} skipped (single class).")
+                log.warning(msg)
+                with open(skipped_file, "a") as f:
+                    f.write(msg + "\n")
+                continue
 
-    baselines = {
-        "majority": DummyClassifier(strategy="most_frequent"),
-        "logistic_regression": LogisticRegression(max_iter=1000, random_state=42),
-        "random_forest": RandomForestClassifier(
-            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
-        ),
-    }
+            n_pos_train = int(y_train.sum())
+            n_neg_train = len(y_train) - n_pos_train
+            spw = n_neg_train / max(n_pos_train, 1)
 
-    # Evaluate baselines
-    for model_name, model in baselines.items():
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        if hasattr(model, "predict_proba"):
-            y_prob = model.predict_proba(X_test)[:, 1]
+            # Baselines
+            baselines = {
+                "majority": DummyClassifier(strategy="most_frequent"),
+                "logistic_regression": LogisticRegression(max_iter=1000, random_state=42),
+                "random_forest": RandomForestClassifier(
+                    n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+                ),
+            }
+
+            for model_name, model in baselines.items():
+                from sklearn.base import clone
+                model_clone = clone(model)
+                model_clone.fit(X_train, y_train)
+                y_pred = model_clone.predict(X_test)
+                if hasattr(model_clone, "predict_proba"):
+                    y_prob = model_clone.predict_proba(X_test)[:, 1]
+                    pr_auc = average_precision_score(y_test, y_prob)
+                else:
+                    pr_auc = float("nan")
+                f1 = f1_score(y_test, y_pred, zero_division=0)
+                mcc = matthews_corrcoef(y_test, y_pred)
+
+                fold_results.append({
+                    "pass_name": pass_name, "target": target_name,
+                    "model": model_name, "repeat": rep, "fold": fold_idx,
+                    "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
+                    "mcc": round(mcc, 4),
+                    "n_train": len(y_train), "n_test": len(y_test),
+                    "pos_rate_train": round(y_train.mean(), 4),
+                    "pos_rate_test": round(y_test.mean(), 4),
+                })
+                baseline_vecs[model_name].append(pr_auc)
+
+            # XGBoost with nested tuning
+            xgb_model = nested_tune_xgboost(X_train, y_train, groups_train, rng)
+            y_pred = xgb_model.predict(X_test)
+            y_prob = xgb_model.predict_proba(X_test)[:, 1]
             pr_auc = average_precision_score(y_test, y_prob)
-        else:
-            pr_auc = float("nan")
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-        mcc = matthews_corrcoef(y_test, y_pred)
-        
-        # Bootstrap CI for Wilcoxon
-        boot_prauc = []
-        unique_test_programs = np.unique(groups_test)
-        if len(unique_test_programs) >= 2 and not pd.isna(pr_auc):
-            for _ in range(15): # 15 bootstrap samples to simulate the 3x5 folds for Wilcoxon
-                sampled = rng.choice(unique_test_programs, size=len(unique_test_programs), replace=True)
-                boot_idx = []
-                for p in sampled:
-                    boot_idx.extend(np.where(groups_test == p)[0])
-                if len(set(y_test[boot_idx])) >= 2:
-                    boot_prauc.append(average_precision_score(y_test[boot_idx], y_prob[boot_idx]))
-        if not boot_prauc:
-            boot_prauc = [pr_auc] * 15
-        baseline_vecs[model_name] = boot_prauc
+            f1 = f1_score(y_test, y_pred, zero_division=0)
+            mcc = matthews_corrcoef(y_test, y_pred)
 
-        fold_results.append({
-            "pass_name": pass_name, "target": target_name,
-            "model": model_name, "repeat": 0, "fold": 0,
-            "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
-            "mcc": round(mcc, 4),
-            "n_train": len(y_train), "n_test": len(y_test),
-            "pos_rate_train": round(y_train.mean(), 4),
-            "pos_rate_test": round(y_test.mean(), 4),
-        })
+            fold_results.append({
+                "pass_name": pass_name, "target": target_name,
+                "model": "xgboost", "repeat": rep, "fold": fold_idx,
+                "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
+                "mcc": round(mcc, 4),
+                "n_train": len(y_train), "n_test": len(y_test),
+                "pos_rate_train": round(y_train.mean(), 4),
+                "pos_rate_test": round(y_test.mean(), 4),
+            })
+            xgb_prauc_vec.append(pr_auc)
 
-    # XGBoost with nested tuning
-    xgb_model = nested_tune_xgboost(X_train, y_train, groups_train, rng)
-    y_pred = xgb_model.predict(X_test)
-    y_prob = xgb_model.predict_proba(X_test)[:, 1]
-    pr_auc = average_precision_score(y_test, y_prob)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    mcc = matthews_corrcoef(y_test, y_pred)
+            if pr_auc > best_xgb_score:
+                best_xgb_score = pr_auc
+                best_xgb_model = xgb_model
 
-    boot_prauc_xgb = []
-    unique_test_programs = np.unique(groups_test)
-    if len(unique_test_programs) >= 2 and not pd.isna(pr_auc):
-        for _ in range(15): # 15 bootstrap samples to simulate the 3x5 folds for Wilcoxon
-            sampled = rng.choice(unique_test_programs, size=len(unique_test_programs), replace=True)
-            boot_idx = []
-            for p in sampled:
-                boot_idx.extend(np.where(groups_test == p)[0])
-            if len(set(y_test[boot_idx])) >= 2:
-                boot_prauc_xgb.append(average_precision_score(y_test[boot_idx], y_prob[boot_idx]))
-    if not boot_prauc_xgb:
-        boot_prauc_xgb = [pr_auc] * 15
-    xgb_prauc_vec = boot_prauc_xgb
-
-    fold_results.append({
-        "pass_name": pass_name, "target": target_name,
-        "model": "xgboost", "repeat": 0, "fold": 0,
-        "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
-        "mcc": round(mcc, 4),
-        "n_train": len(y_train), "n_test": len(y_test),
-        "pos_rate_train": round(y_train.mean(), 4),
-        "pos_rate_test": round(y_test.mean(), 4),
-    })
-
-    model_path = save_dir / f"xgb_{pass_name}_{target_name}.pkl"
-    with open(model_path, "wb") as f:
-        import pickle
-        pickle.dump(xgb_model, f)
+    # Save best XGBoost model (one per pass per target)
+    if best_xgb_model is not None:
+        model_path = save_dir / f"xgb_{pass_name}_{target_name}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(best_xgb_model, f)
 
     return fold_results, xgb_prauc_vec, baseline_vecs
-
 
 
 # ============================================================================

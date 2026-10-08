@@ -97,23 +97,42 @@ log = setup_logging()
 # Minimum LLVM version we support
 MIN_LLVM_VERSION = 17
 
+# The LLVM major version this project is pinned to. Thresholds in
+# heuristics.yaml were read from the release/17.x sources, so labels must be
+# generated with the same release.
+PINNED_LLVM_VERSION = 17
+
 # Tool names (may have version suffixes like clang-17)
 _TOOL_NAMES = ["clang", "opt", "llvm-extract", "llvm-dis", "llvm-as"]
 
 
 def _find_tool(name: str) -> Optional[str]:
-    """Find an LLVM tool, trying bare name first, then with version suffixes."""
-    # Try bare name
+    """
+    Find an LLVM tool.
+
+    Order of preference:
+      1. The pinned version suffix, e.g. "clang-17" (PINNED_LLVM_VERSION).
+         This matters on machines where the bare name "clang" points to a
+         different LLVM release than the one the project is pinned to.
+      2. The bare name, e.g. "clang".
+      3. Other version suffixes (newest first).
+      4. On Windows only: the same names inside WSL (slow bridge, see README).
+    """
+    # 1. Pinned version first, so labels are reproducible across machines
+    path = shutil.which(f"{name}-{PINNED_LLVM_VERSION}")
+    if path:
+        return path
+    # 2. Bare name
     path = shutil.which(name)
     if path:
         return path
-    # Try with version suffixes 17-20
+    # 3. Any other supported version suffix
     for ver in range(20, MIN_LLVM_VERSION - 1, -1):
         path = shutil.which(f"{name}-{ver}")
         if path:
             return path
-            
-    # Try via WSL if on Windows
+
+    # 4. Try via WSL if on Windows
     if sys.platform == "win32":
         try:
             res = subprocess.run(["wsl", "which", name], capture_output=True, text=True)
@@ -125,7 +144,7 @@ def _find_tool(name: str) -> Optional[str]:
                     return f"wsl:{name}-{ver}"
         except Exception:
             pass
-            
+
     return None
 
 
@@ -172,6 +191,26 @@ def get_llvm_version(tools: dict) -> str:
     return match.group(1) if match else "unknown"
 
 
+def require_pinned_llvm(tools: dict) -> str:
+    """
+    Stop the run unless the LLVM tools are the pinned major version.
+    Labels depend on the exact behaviour of each pass, so mixing LLVM
+    releases would silently change the dataset.
+    Set PASSLENS_ALLOW_ANY_LLVM=1 to override (the version is still logged).
+    Returns the version string.
+    """
+    version = get_llvm_version(tools)
+    major = version.split(".")[0]
+    if major != str(PINNED_LLVM_VERSION):
+        message = (f"LLVM {version} found, but the project is pinned to "
+                   f"LLVM {PINNED_LLVM_VERSION}.x (tools: {tools}).")
+        if os.environ.get("PASSLENS_ALLOW_ANY_LLVM") == "1":
+            log.warning("%s Continuing because PASSLENS_ALLOW_ANY_LLVM=1.", message)
+        else:
+            raise RuntimeError(message + " Install LLVM 17 or set PASSLENS_ALLOW_ANY_LLVM=1.")
+    return version
+
+
 # ============================================================================
 # Subprocess helpers
 # ============================================================================
@@ -204,22 +243,26 @@ def run_tool(
         else:
             actual_cmd = [str(x) for x in cmd]
 
+        # encoding/errors are set explicitly: compiler messages can quote
+        # source lines that are not valid UTF-8, and that must not crash us.
         result = subprocess.run(
             actual_cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             input=input_data,
         )
         if check and result.returncode != 0:
-            log.error("Command failed: %s", " ".join(cmd))
+            log.error("Command failed: %s", " ".join(str(c) for c in cmd))
             log.error("stderr: %s", result.stderr[:2000])
             raise subprocess.CalledProcessError(
                 result.returncode, cmd, result.stdout, result.stderr
             )
         return result
     except subprocess.TimeoutExpired:
-        log.warning("Timeout (%ds) for: %s", timeout, " ".join(cmd))
+        log.warning("Timeout (%ds) for: %s", timeout, " ".join(str(c) for c in cmd))
         raise
 
 
@@ -227,65 +270,180 @@ def run_tool(
 # IR utilities
 # ============================================================================
 
-def normalize_ir(ir_text: str) -> str:
+# A basic-block label line.  LLVM prints a label as either
+#     name:        where name uses the characters  - a-z A-Z $ . _ 0-9
+#     "any text":  (quoted, when the name has other characters)
+# optionally followed by a comment such as "; preds = %3, %7".
+# NOTE: clang release builds discard value names, so most labels are purely
+# numeric ("12:").  The label pattern MUST accept those.
+_LABEL_RE = re.compile(r'^(?:([-a-zA-Z$._0-9]+)|"((?:[^"\\]|\\.)*)"):\s*(;.*)?$')
+
+# Lines that belong to the PREVIOUS instruction (they are not instructions):
+#   - the second line of an invoke / callbr:   "to label %a unwind label %b"
+#   - landingpad clauses:                       "catch ...", "cleanup", "filter ..."
+_CONTINUATION_PREFIXES = ("to label ", "catch ", "cleanup", "filter ")
+
+
+def iter_function_body(ir_text: str):
     """
-    Normalize LLVM IR text for deduplication.
-    Strips comments, metadata IDs, and debug locations so that
-    semantically identical functions hash the same.
+    Walk the body of every function DEFINITION in an IR module and yield one
+    tuple per meaningful line:
+
+        ("label", block_name)        a basic-block label
+        ("inst",  instruction_text)  one instruction
+
+    This is the ONE place that decides what counts as an instruction.  Both
+    the label generator (count_instructions) and the feature extractor use
+    it, so the two can never disagree.
+
+    The count matches LLVM's own TotalInstructionCount (checked in Phase 1
+    against `opt -passes='print<func-properties>'`).
     """
-    lines = []
+    in_function = False    # are we between "define ... {" and "}" ?
+    pending_switch = None  # text of a switch whose case list is still open
+
     for line in ir_text.splitlines():
-        # Remove comments
-        line = re.sub(r";.*$", "", line)
-        # Remove metadata references like !dbg !42
-        line = re.sub(r"!dbg !\d+", "", line)
-        # Remove metadata definitions like !42 = ...
-        if re.match(r"^!\d+\s*=", line):
+        stripped = line.strip()
+
+        # Skip empty lines and whole-line comments
+        if not stripped or stripped.startswith(";"):
             continue
-        # Normalize whitespace
-        line = line.strip()
-        if line:
-            lines.append(line)
-    return "\n".join(lines)
 
+        # Function start
+        if not in_function:
+            if stripped.startswith("define "):
+                in_function = True
+                pending_switch = None
+            continue
 
-def hash_ir(ir_text: str) -> str:
-    """SHA256 hash of normalized IR text, for deduplication and caching."""
-    normalized = normalize_ir(ir_text)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        # Inside a multi-line switch: every line up to "]" is a case, not an
+        # instruction.  We glue the cases onto the switch text so that the
+        # caller sees ONE instruction that lists every branch target:
+        #     switch i32 %x, label %default [
+        #       i32 0, label %a
+        #       i32 1, label %b
+        #     ]
+        if pending_switch is not None:
+            pending_switch += " " + stripped
+            if stripped.startswith("]"):
+                yield ("inst", pending_switch)
+                pending_switch = None
+            continue
+
+        # Function end
+        if stripped == "}":
+            in_function = False
+            continue
+
+        # Basic-block label
+        label_match = _LABEL_RE.match(stripped)
+        if label_match:
+            name = label_match.group(1) if label_match.group(1) is not None else label_match.group(2)
+            yield ("label", name)
+            continue
+
+        # Continuation lines of invoke / landingpad
+        if stripped.startswith(_CONTINUATION_PREFIXES):
+            continue
+
+        # A switch whose case list continues on the following lines ends
+        # with "[" (ignore a trailing comment when checking).  Hold it back
+        # until the closing "]" arrives.
+        code_part = stripped.split(";")[0].rstrip()
+        if code_part.endswith("["):
+            pending_switch = code_part
+            continue
+
+        # Anything else inside a function body is one instruction
+        yield ("inst", stripped)
 
 
 def count_instructions(ir_text: str) -> int:
     """
-    Count the number of LLVM IR instructions in the text.
-    An instruction is any non-label, non-comment, non-empty line inside
-    a function body that is not a metadata definition.
+    Count LLVM IR instructions in all function definitions of the module.
+    Labels, comments, switch case lines and metadata are NOT instructions.
     """
     count = 0
-    in_function = False
-    for line in ir_text.splitlines():
-        stripped = line.strip()
-        # Skip empty lines and comments
-        if not stripped or stripped.startswith(";"):
-            continue
-        # Track function boundaries
-        if stripped.startswith("define "):
-            in_function = True
-            continue
-        if stripped == "}" and in_function:
-            in_function = False
-            continue
-        if not in_function:
-            continue
-        # Skip labels (lines ending with ':' that aren't instructions)
-        if re.match(r"^[a-zA-Z_.][a-zA-Z0-9_.]*:\s*(;.*)?$", stripped):
-            continue
-        # Skip metadata definitions
-        if re.match(r"^!\d+\s*=", stripped):
-            continue
-        # This is an instruction
-        count += 1
+    for kind, _ in iter_function_body(ir_text):
+        if kind == "inst":
+            count += 1
     return count
+
+
+# Metadata attachment at the end of an instruction, e.g. ", !dbg !42" or
+# ", !llvm.loop !7" or ", !tbaa !3"
+_METADATA_ATTACHMENT_RE = re.compile(r",?\s*![a-zA-Z_.][a-zA-Z0-9_.]*\s+!\d+")
+# Attribute-group reference, e.g. "#0"
+_ATTR_GROUP_RE = re.compile(r"\s#\d+")
+
+
+def normalize_ir(ir_text: str) -> str:
+    """
+    Normalize LLVM IR text so that two modules that differ only in comments,
+    metadata or attribute-group numbering compare equal.
+
+    Removed: comments, metadata attachments (!dbg, !llvm.loop, !tbaa ...),
+    metadata definitions (!42 = ...), named metadata, attribute groups,
+    the ModuleID / source_filename lines, and extra whitespace.
+    """
+    lines = []
+    for line in ir_text.splitlines():
+        # Remove comments (text after ';').  String constants in C benchmarks
+        # can contain ';' but they live in global initializers, which do not
+        # affect the function-body comparison we use this for.
+        line = re.sub(r";.*$", "", line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Drop metadata definitions like "!42 = ..." and "!llvm.loop = ..."
+        if stripped.startswith("!"):
+            continue
+        # Drop attribute group definitions and the source file name
+        if stripped.startswith("attributes #") or stripped.startswith("source_filename"):
+            continue
+        # Remove metadata attachments and attribute group references
+        stripped = _METADATA_ATTACHMENT_RE.sub("", stripped)
+        stripped = _ATTR_GROUP_RE.sub("", stripped)
+        # Collapse runs of whitespace
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        if stripped:
+            lines.append(stripped)
+    return "\n".join(lines)
+
+
+def function_body_text(ir_text: str) -> str:
+    """
+    Return the normalized text of the function DEFINITIONS only
+    (from each "define" line to its closing "}").
+    Declarations, globals, types and target lines are left out.
+    """
+    out = []
+    in_function = False
+    for line in normalize_ir(ir_text).splitlines():
+        if not in_function and line.startswith("define "):
+            in_function = True
+        if in_function:
+            out.append(line)
+            if line == "}":
+                in_function = False
+    return "\n".join(out)
+
+
+def hash_ir(ir_text: str, func_name: Optional[str] = None) -> str:
+    """
+    Hash of the normalized function body, used for deduplication, caching
+    and the train/test leakage audit.
+
+    Only the function definition is hashed (not the surrounding module), so
+    the same function copied into two source files gets the same hash.
+    If func_name is given, the function's own name is replaced by a fixed
+    placeholder, so two identical functions with different names also match.
+    """
+    body = function_body_text(ir_text)
+    if func_name:
+        # Replace "@name" when it is not followed by another name character
+        body = re.sub(r"@" + re.escape(func_name) + r"(?![-a-zA-Z$._0-9])", "@__FUNC__", body)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
 def read_ir_file(path: Path) -> str:

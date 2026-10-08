@@ -1,7 +1,7 @@
 ; ModuleID = 'branch_heavy'
 ; A function with many conditional branches and no loops.
-; Expected: 13 instructions, 5 BBs, 0 loops, 4 cond_br (icmp+br pairs),
-;           1 uncond_br, 3 icmp, multiple CFG edges.
+; Expected: 12 instructions, 5 BBs, 0 loops, 3 cond_br, 1 uncond_br,
+;           3 icmp, 7 CFG edges.
 
 define i32 @branch_heavy(i32 %x) {
 entry:

@@ -1,16 +1,1 @@
 # Skipped Folds
-Fold rep=0 fold=0 pass=instcombine target=beneficial skipped (single class).
-Fold rep=0 fold=1 pass=instcombine target=beneficial skipped (single class).
-Fold rep=0 fold=2 pass=instcombine target=beneficial skipped (single class).
-Fold rep=1 fold=0 pass=instcombine target=beneficial skipped (single class).
-Fold rep=1 fold=1 pass=instcombine target=beneficial skipped (single class).
-Fold rep=1 fold=2 pass=instcombine target=beneficial skipped (single class).
-Fold rep=2 fold=0 pass=instcombine target=beneficial skipped (single class).
-Fold rep=2 fold=1 pass=instcombine target=beneficial skipped (single class).
-Fold rep=2 fold=2 pass=instcombine target=beneficial skipped (single class).
-Fold rep=0 fold=2 pass=gvn target=beneficial skipped (single class).
-Fold rep=1 fold=2 pass=gvn target=beneficial skipped (single class).
-Fold rep=2 fold=2 pass=gvn target=beneficial skipped (single class).
-Fold rep=0 fold=2 pass=indvars target=beneficial skipped (single class).
-Fold rep=1 fold=1 pass=indvars target=beneficial skipped (single class).
-Fold rep=2 fold=0 pass=indvars target=beneficial skipped (single class).

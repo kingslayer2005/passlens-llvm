@@ -1,12 +1,41 @@
+PHASE 3 GATE REPORT
+====================================================================================================
+LLVM version:                 17.0.6
+Mode:                         FULL
+Functions:                    1038
+Programs (groups):            53
+States (samples):             2953
+  baseline states:            1038
+  prefix states:              1915
+  dropped, same IR as an earlier state of the function: 1199
+  dropped, same IR as a state of another function:      0
+Label rows (state x pass):    53154
+Failed opt calls:             0  (see results/phase3_failures.csv)
+Feature columns:              40
+Determinism check:            50/50 rows identical on rerun
+Run time this session:        705 s for 1038 functions
 
-╔══════════════════════════════════════════════════════╗
-║              PHASE 3 GATE REPORT                     ║
-╠══════════════════════════════════════════════════════╣
-║ Total samples:               720                     ║
-║ Functions:                    10                     ║
-║ Passes (active):              18                     ║
-║ Passes (kept):                 7                     ║
-║ Passes (dropped):             11                     ║
-╠══════════════════════════════════════════════════════╣
-║ Dropped passes: sroa, sccp, adce, dse, reassociate, correlated-propagation, licm, loop-deletion, loop-idiom, loop-unroll, tailcallelim║
-╚══════════════════════════════════════════════════════╝
+pass                         n  err  fired   decr  equal   incr  incr,not fired        beneficial         harmful           fired
+sroa                      2953    0     67     55   2890      8               0         1.8% drop       0.3% drop       2.3% drop
+instcombine               2953    0   2664   2148    794     11               0        71.9% keep       0.4% drop      90.2% keep
+simplifycfg               2953    0   2156   2083    859     11               0        68.4% keep       0.4% drop      73.0% keep
+early-cse                 2953    0   2035   2035    918      0               0        68.1% keep       0.0% drop      68.9% keep
+gvn                       2953    0   2320   2254    660     39               0        75.6% keep       1.3% drop      78.6% keep
+sccp                      2953    0    640    134   2819      0               0         3.1% drop       0.0% drop      21.7% keep
+adce                      2953    0    271    270   2683      0               0         6.0% keep       0.0% drop       9.2% keep
+dse                       2953    0     61     55   2892      6               0         1.3% drop       0.2% drop       2.1% drop
+reassociate               2953    0   1190    340   2486    127               0         6.9% keep       4.3% drop      40.3% keep
+jump-threading            2953    0   1924   1889   1048     16               0        61.5% keep       0.5% drop      65.1% keep
+correlated-propagation    2953    0   1787    455   2470     28               0        12.2% keep       0.9% drop      60.5% keep
+licm                      2953    0   1197    102   2126    725             242         2.5% drop      24.6% keep      40.5% keep
+loop-rotate               2953    0   1589    198   1315   1440             100         5.4% keep      48.8% keep      53.8% keep
+indvars                   2953    0   1259    474   1674    805             248        14.2% keep      27.3% keep      42.6% keep
+loop-deletion             2953    0     19      6   2223    724             711         0.2% drop      24.5% keep       0.6% drop
+loop-idiom                2953    0     13      0   2225    728             719         0.0% drop      24.6% keep       0.4% drop
+loop-unroll               2953    0    336      2   2047    904             571         0.1% drop      30.6% keep      11.4% keep
+tailcallelim              2953    0   1893      0   2943     10               0         0.0% drop       0.3% drop      64.1% keep
+
+decr / equal / incr compare the instruction count after the pass with the count before.
+fired = the pass output differs from its control run (see the file header).
+'incr,not fired' = size grew only because of loop canonicalization, not the pass.
+A target is kept when its positive rate is between 5% and 95%.

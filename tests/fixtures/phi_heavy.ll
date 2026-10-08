@@ -1,7 +1,7 @@
 ; ModuleID = 'phi_heavy'
 ; A function with many phi nodes across multiple merge points.
-; Expected: 14 instructions, 5 BBs, 0 loops, 4 phi nodes total,
-;           phi_args_total = 10 (2+2+3+3).
+; Expected: 17 instructions, 6 BBs, 0 loops, 6 phi nodes total,
+;           phi_args_total = 10 (1+1+2+2+2+2).
 
 define i32 @phi_heavy(i32 %x, i32 %y) {
 entry:

@@ -1,7 +1,7 @@
 ; ModuleID = 'call_heavy'
 ; A function with many different call types: direct, intrinsic, and recursive.
-; Expected: 12 instructions, 3 BBs, 0 loops,
-;           direct_calls=2 (bar, baz), intrinsic_calls=2 (llvm.abs, llvm.smax),
+; Expected: 11 instructions, 3 BBs, 0 loops,
+;           direct_calls=2 (bar, baz), intrinsic_calls=3 (llvm.abs twice, llvm.smax),
 ;           self_recursive_calls=1 (call_heavy calls itself).
 
 declare i32 @bar(i32)

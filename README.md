@@ -1,4 +1,4 @@
-# PRELIMINARY: smoke run on 52 programs, not a research result
+# Data: full run (1038 functions, 2953 states). Models and explanations: not yet run on this data.
 # Interpretable Compiler Pass Selection: Explaining ML-Guided Optimization Decisions using SHAP on LLVM IR Features
 **Authors:** Aarush Gupta (23BDS0219) + [teammates TBD]
 

@@ -1,0 +1,17 @@
+[PASS] every state has one row for each of the 18 passes — 2953 states
+[PASS] state hashes are unique in features.csv
+[PASS] features.csv and labels.csv hold the same states
+[PASS] no state hash appears in two programs
+[PASS] no function appears in two programs
+[PASS] no missing feature values
+[PASS] no raw count features — 40 features
+       features with a single value in the whole dataset: ['invoke_density']
+[PASS] rel_reduction matches inst_before / inst_after
+[PASS] outcome matches the counts
+[PASS] beneficial == (rel_reduction >= 1%)
+[PASS] harmful == (outcome is increased)
+[PASS] rows with unchanged IR have an unchanged count — 29121 rows
+[PASS] baseline inst_before equals the Phase 1 index
+[PASS] pass OUTPUT: our counts equal LLVM's counts, and equal the stored labels — 300 random rows rebuilt from scratch, 134 of them with IR changed by the pass
+
+RESULT: ALL CHECKS PASSED

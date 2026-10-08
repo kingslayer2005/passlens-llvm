@@ -113,8 +113,9 @@ def evaluate_pruning_for_pass(pass_name, df_merged, feature_cols):
     from xgboost import XGBClassifier
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+    from scripts.targets import build_target_labels
+    y = build_target_labels(pass_df, pass_name, "beneficial").values.astype(int)
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df["beneficial"].values.astype(int)
     groups = pass_df["program"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -262,6 +263,12 @@ def run_phase6(smoke: bool = False):
         how="inner",
     )
     feature_cols = [c for c in feature_cols if c in df_merged.columns]
+
+    if smoke:
+        p_poly = sorted(df_merged[df_merged["suite"] == "polybench"]["program"].unique())[:1]
+        p_mi = sorted(df_merged[df_merged["suite"] == "mibench"]["program"].unique())[:1]
+        smoke_progs = list(p_poly) + list(p_mi)
+        df_merged = df_merged[df_merged["program"].isin(smoke_progs)]
 
     log.info("Phase 6: pruning study for %d passes with %d features",
              len(interp_passes), len(feature_cols))

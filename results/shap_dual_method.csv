@@ -1,4 +1,0 @@
-pass_name,target,stability_tau,dual_method_tau,beats_majority,stable,interpretable
-simplifycfg,beneficial,0.7329,,True,True,True
-early-cse,beneficial,0.6591,,True,True,True
-jump-threading,beneficial,0.704,,True,True,True

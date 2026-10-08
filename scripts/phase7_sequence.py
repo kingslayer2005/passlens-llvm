@@ -265,11 +265,8 @@ def run_phase7(smoke: bool = False):
     df_index = pd.read_csv(index_path)
     df_index = df_index[df_index["is_duplicate"] == False].copy()
 
-    # For held-out evaluation, use a simple split: last 20% of programs
-    programs = sorted(df_index["program"].unique())
-    n_held_out = max(1, len(programs) // 5)
-    held_out_programs = programs[-n_held_out:]
-    df_held_out = df_index[df_index["program"].isin(held_out_programs)]
+    df_held_out = df_index[df_index["suite"] == "mibench"]
+    held_out_programs = df_held_out["program"].unique()
 
     if smoke:
         df_held_out = df_held_out.head(5)

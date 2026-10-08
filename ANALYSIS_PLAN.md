@@ -148,3 +148,56 @@ Recompute the beneficial label at thresholds 0.5 %, 1 %, 2 % from the stored
 2. If a pass has positive rate outside [5 %, 95 %] -> **drop** that pass for that target.
 3. If XGBoost does not beat majority after Holm correction -> **do not interpret** that target. (Gating is per target).
 4. If SHAP stability tau < 0.6 -> **do not interpret** that target. (Gating is per target).
+
+---
+
+## Amendment 1 (2026-10-08, before any model was fitted on the full data)
+
+The data pipeline (Phases 1-3) was corrected after defects were found in the
+instruction counter and the feature extractor (listed in `STATUS.md`). No
+model, SHAP value or heuristic-agreement score had been computed on the full
+data when this amendment was written. The sections above are unchanged
+except where stated here.
+
+### A1. Instruction count
+One text parser (`utils.iter_function_body`) defines what an instruction is,
+for labels and for features. It is validated against LLVM's
+`print<func-properties>` on every compiled function.
+
+### A2. Features (40)
+Densities (count / instruction count) for 32 opcode and CFG classes, now
+including `bitwise_density` and `shift_density`; `log_inst_count`;
+`mean_insts_per_bb`, `max_insts_per_bb`; and five loop features taken from
+LLVM's LoopInfo: `loop_count_density`, `max_loop_depth`,
+`max_loop_header_size`, `min_loop_header_size`, `innermost_loop_body_size`.
+No raw counts.
+
+### A3. Samples
+A sample is a state: the baseline function or the result of a seeded random
+prefix of 1-3 passes. States with IR identical to an earlier state are
+dropped. `ir_hash` is the hash of the normalized function body with the
+function's own name replaced, so it is unique per state in the dataset.
+
+### A4. Grouping
+`program` is the benchmark program (PolyBench kernel folder; MiBench
+`<category>/<benchmark>`). Duplicate bodies are removed over the whole
+dataset first, then each program is capped at 100 functions (seeded).
+
+### A5. Third target: `fired`
+`fired` = the pass output differs from its control run. Kept under the same
+5 %-95 % rule. It is scored against the applicability list of
+`heuristics.yaml`.
+
+### A6. Control run for loop passes
+For `licm`, `loop-rotate`, `indvars`, `loop-deletion`, `loop-idiom` and
+`loop-unroll` the control is the same loop adaptor with `no-op-loop`
+(LoopSimplify + LCSSA only). `inst_control` is the instruction count after
+the control; for all other passes it equals `inst_before`.
+
+### A7. OPEN: target definition for the six loop passes
+To be decided and written here before Phase 4 is run:
+`beneficial` and `harmful` for the six loop passes are computed from
+`inst_control` instead of `inst_before` (recommended), or kept as in
+Section 1. The kept/dropped targets in `results/phase3_gate.txt` use the
+Section 1 definition.
+

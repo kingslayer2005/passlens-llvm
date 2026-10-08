@@ -33,6 +33,7 @@ from scripts.utils import (
     PROJECT_ROOT, DATA_DIR, FEATURES_DIR, IR_DIR,
     ensure_dirs, find_llvm_tools, run_tool,
     count_instructions, read_ir_file, setup_logging,
+    iter_function_body,
 )
 
 log = setup_logging("phase2")
@@ -44,8 +45,14 @@ log = setup_logging("phase2")
 # Integer arithmetic opcodes
 INT_ARITH_OPS = {"add", "sub", "mul", "udiv", "sdiv", "urem", "srem"}
 
-# Floating-point arithmetic opcodes
-FP_ARITH_OPS = {"fadd", "fsub", "fmul", "fdiv", "frem"}
+# Bitwise logic opcodes (and / or / xor)
+BITWISE_OPS = {"and", "or", "xor"}
+
+# Shift opcodes
+SHIFT_OPS = {"shl", "lshr", "ashr"}
+
+# Floating-point arithmetic opcodes ("fneg" is the unary FP negate)
+FP_ARITH_OPS = {"fadd", "fsub", "fmul", "fdiv", "frem", "fneg"}
 
 # Comparison opcodes
 CMP_OPS = {"icmp", "fcmp"}
@@ -104,85 +111,58 @@ class IRFeatureExtractor:
         return "unknown"
 
     def _parse(self):
-        """Parse the IR text into basic blocks and instructions."""
-        in_function = False
-        current_bb_label = None
+        """
+        Parse the IR text into basic blocks and instructions.
+
+        Uses utils.iter_function_body, the same line classifier that
+        count_instructions uses, so len(self.instructions) is always equal
+        to count_instructions(ir_text).
+        """
+        # The entry block has no printed label in clang output, so we give
+        # it a fixed internal name.  Nothing can branch to the entry block,
+        # so this name never has to match a branch target.
+        current_bb_label = "<entry>"
         current_bb_insts = []
-        brace_depth = 0
+        seen_any_line = False
 
-        for line in self.lines:
-            stripped = line.strip()
-
-            # Skip empty lines and comments
-            if not stripped or stripped.startswith(";"):
-                continue
-
-            # Track function entry
-            if stripped.startswith("define "):
-                in_function = True
-                brace_depth += stripped.count("{") - stripped.count("}")
-                # The entry block might not have a label
-                current_bb_label = "entry"
-                current_bb_insts = []
-                continue
-
-            if not in_function:
-                continue
-
-            # Track braces for function end
-            brace_depth += stripped.count("{") - stripped.count("}")
-            if brace_depth <= 0:
-                # Save the last basic block
-                if current_bb_insts:
+        for kind, text in iter_function_body(self.ir_text):
+            if kind == "label":
+                # A label starts a new block.  Save the previous block,
+                # unless it is the empty implicit entry block that exists
+                # only because the first real block had an explicit label.
+                if current_bb_insts or seen_any_line:
                     self.basic_blocks.append((current_bb_label, current_bb_insts))
-                in_function = False
+                current_bb_label = text
                 current_bb_insts = []
+                seen_any_line = True
                 continue
 
-            # Check for basic block label
-            label_match = re.match(r"^([a-zA-Z_.][a-zA-Z0-9_.]*):(\s*;.*)?$", stripped)
-            # Also match numeric labels like "42:"
-            if not label_match:
-                label_match = re.match(r"^(\d+):(\s*;.*)?$", stripped)
+            # kind == "inst"
+            seen_any_line = True
+            opcode = self._extract_opcode(text)
+            self.instructions.append((opcode, text))
+            current_bb_insts.append((opcode, text))
 
-            if label_match:
-                # Save previous basic block
-                if current_bb_label is not None and current_bb_insts:
-                    self.basic_blocks.append((current_bb_label, current_bb_insts))
-                current_bb_label = label_match.group(1)
-                current_bb_insts = []
-                continue
+            # Count phi arguments
+            if opcode == "phi":
+                self.phi_args_total += self._count_phi_args(text)
 
-            # Skip metadata definitions
-            if re.match(r"^!\d+\s*=", stripped):
-                continue
+            # Classify calls
+            if opcode in ("call", "invoke"):
+                self._classify_call(text)
 
-            # This is an instruction — parse it
-            opcode = self._extract_opcode(stripped)
-            if opcode:
-                self.instructions.append((opcode, stripped))
-                current_bb_insts.append((opcode, stripped))
+            # Count constant operands
+            self.const_operands += self._count_constants(text)
 
-                # Count phi arguments
-                if opcode == "phi":
-                    self.phi_args_total += self._count_phi_args(stripped)
+            # Track CFG edges from terminators
+            if opcode in ("br", "switch", "invoke", "indirectbr"):
+                self._extract_cfg_edges(current_bb_label, opcode, text)
 
-                # Classify calls
-                if opcode in ("call", "invoke"):
-                    self._classify_call(stripped)
-
-                # Count constant operands
-                self.const_operands += self._count_constants(stripped)
-
-                # Track CFG edges from terminators
-                if opcode in ("br", "switch", "invoke", "indirectbr"):
-                    self._extract_cfg_edges(current_bb_label, opcode, stripped)
-
-        # Handle case where function didn't close properly
+        # Save the last basic block
         if current_bb_insts:
             self.basic_blocks.append((current_bb_label, current_bb_insts))
 
-    def _extract_opcode(self, line: str) -> Optional[str]:
+    def _extract_opcode(self, line: str) -> str:
         """
         Extract the opcode from an instruction line.
 
@@ -191,17 +171,21 @@ class IRFeatureExtractor:
           opcode ...           (for void instructions like store, br, ret)
           tail call ...        (tail calls)
           musttail call ...
+
+        Every instruction gets an opcode.  Opcodes we do not put in a
+        feature class are still returned (and still counted as
+        instructions); they simply do not add to any class density.
         """
-        # Remove leading assignment: "%foo = " or "%foo.bar = "
+        # Remove leading assignment: "%foo = ", "%12 = " or '%"odd name" = '
         inst_part = line
-        assign_match = re.match(r"^%[a-zA-Z0-9_.]+\s*=\s*(.+)$", line)
+        assign_match = re.match(r'^%(?:[-a-zA-Z$._0-9]+|"(?:[^"\\]|\\.)*")\s*=\s*(.+)$', line)
         if assign_match:
             inst_part = assign_match.group(1)
 
-        # The first word of inst_part should be the opcode (or a modifier)
+        # The first word of inst_part is the opcode (or a call modifier)
         words = inst_part.split()
         if not words:
-            return None
+            return "unknown"
 
         opcode = words[0]
 
@@ -209,29 +193,7 @@ class IRFeatureExtractor:
         if opcode in ("tail", "musttail", "notail") and len(words) > 1:
             opcode = words[1]
 
-        # Handle 'nsw add' -> 'add' (shouldn't happen, but be safe)
-        # Actually in LLVM IR, flags come AFTER the opcode: 'add nsw i32 ...'
-        # But atomicrmw, cmpxchg have special syntax
-
-        # Check if it's a known opcode
-        all_opcodes = (INT_ARITH_OPS | FP_ARITH_OPS | CMP_OPS | CAST_OPS |
-                       MEMORY_OPS | TERM_OPS |
-                       {"phi", "select", "call", "invoke",
-                        "extractelement", "insertelement", "shufflevector",
-                        "extractvalue", "insertvalue",
-                        "fence", "cmpxchg", "atomicrmw",
-                        "landingpad", "catchpad", "cleanuppad",
-                        "catchswitch", "catchret", "cleanupret",
-                        "freeze", "fneg", "va_arg"})
-
-        if opcode in all_opcodes:
-            return opcode
-
-        # GEP can appear as 'getelementptr' keyword
-        if opcode == "getelementptr":
-            return "getelementptr"
-
-        return None
+        return opcode
 
     def _count_phi_args(self, line: str) -> int:
         """Count the number of incoming values in a phi instruction.
@@ -255,45 +217,66 @@ class IRFeatureExtractor:
             # Indirect call (function pointer)
             pass  # Not counted in any category
 
+    # --- patterns used by _count_constants ---
+    # Text that contains digits but is NOT an operand: alignments, array and
+    # vector lengths, and numeric attributes.
+    _NOT_OPERAND_RE = re.compile(
+        r"\balign\s+\d+"                                  # align 8
+        r"|\[\d+\s+x\s"                                   # [900 x double]
+        r"|<(?:vscale\s+x\s+)?\d+\s+x\s"                  # <4 x float>
+        r"|\b(?:align|dereferenceable|dereferenceable_or_null|addrspace|allocsize)\([^)]*\)"
+    )
+    # A numeric literal that stands on its own.  The look-behind rejects
+    # digits that are part of a name or type: %12, @f1, i32, !7, #0, %.03
+    _NUMBER_RE = re.compile(
+        r"(?<![\w.%@!#$\"-])"
+        r"(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|0x[0-9A-Fa-f]+)"
+        r"(?![\w.])"
+    )
+    _CONST_KEYWORD_RE = re.compile(r"\b(?:true|false|null|undef|poison|zeroinitializer)\b")
+
     def _count_constants(self, line: str) -> int:
         """
-        Count constant operands in an instruction.
-        Constants are: integer literals, float literals, 'null', 'undef', 'true', 'false'.
+        Count constant operands in an instruction: integer and floating-point
+        literals, and the keywords true / false / null / undef / poison /
+        zeroinitializer.
+
+        Examples:
+          add nsw i32 %i, 1                        -> 1   (the literal 1)
+          %p = phi i32 [ 0, %entry ], [ %n, %b ]   -> 1   (the literal 0)
+          store double 0.000000e+00, ptr %21, align 8  -> 1  (align is not an operand)
+          getelementptr [900 x double], ptr %6, i64 0, i64 %20 -> 1
         """
-        count = 0
-        # Integer constants: patterns like "i32 42", "i64 -1"
-        count += len(re.findall(r"i\d+\s+-?\d+", line))
-        # Float constants
-        count += len(re.findall(r"(?:float|double)\s+[\d.eE+-]+", line))
-        # Boolean and null constants
-        count += len(re.findall(r"\b(?:true|false|null|undef|zeroinitializer)\b", line))
-        return count
+        # Drop the "%result = " part so a numeric result name is never counted
+        text = re.sub(r'^%(?:[-a-zA-Z$._0-9]+|"(?:[^"\\]|\\.)*")\s*=\s*', "", line)
+        # Drop alignments, array lengths and numeric attributes
+        text = self._NOT_OPERAND_RE.sub(" ", text)
+        return len(self._NUMBER_RE.findall(text)) + len(self._CONST_KEYWORD_RE.findall(text))
 
     def _extract_cfg_edges(self, src_label: str, opcode: str, line: str):
         """Extract CFG edges from terminator instructions."""
-        if opcode == "br":
-            # Conditional: br i1 %cond, label %true, label %false
-            # Unconditional: br label %dest
-            labels = re.findall(r"label\s+%([a-zA-Z0-9_.]+)", line)
-            for lbl in labels:
-                self.cfg_edges.append((src_label, lbl))
-        elif opcode == "switch":
-            labels = re.findall(r"label\s+%([a-zA-Z0-9_.]+)", line)
-            for lbl in labels:
-                self.cfg_edges.append((src_label, lbl))
-        elif opcode == "invoke":
-            labels = re.findall(r"label\s+%([a-zA-Z0-9_.]+)", line)
-            for lbl in labels:
-                self.cfg_edges.append((src_label, lbl))
+        # Branch targets look like:  label %name   or   label %"odd name"
+        # (utils.iter_function_body joins a multi-line switch into one text,
+        #  so every case target is on this line too)
+        for plain, quoted in re.findall(r'label\s+%(?:([-a-zA-Z$._0-9]+)|"((?:[^"\\]|\\.)*)")', line):
+            self.cfg_edges.append((src_label, plain if plain else quoted))
 
     # ================================================================
     # Feature computation
     # ================================================================
 
-    def extract_features(self) -> Dict[str, float]:
+    def extract_features(self, loops: Optional[List[dict]] = None) -> Dict[str, float]:
         """
         Compute all features and return as a dict.
-        Raw counts are stored alongside density features.
+
+        loops: the list returned by parse_loop_info() for this same IR
+               (one dict per loop with its depth and member blocks).
+               If None, the loop features are left out; callers that need
+               them must pass it (see extract_features_from_ir_text).
+
+        Only size-independent features are returned: densities
+        (count / instruction_count), per-block and per-loop sizes, the
+        maximum loop depth, and log_inst_count.  Raw counts are NOT returned.
         """
         features = {}
         inst_count = len(self.instructions)
@@ -305,188 +288,254 @@ class IRFeatureExtractor:
         # -- Opcode class counts --
         opcode_counter = Counter(op for op, _ in self.instructions)
 
-        # Integer arithmetic
-        int_arith = sum(opcode_counter.get(op, 0) for op in INT_ARITH_OPS)
-        features["int_arith_count"] = int_arith
+        counts = {}
+
+        # Integer arithmetic, bitwise logic and shifts
+        counts["int_arith_count"] = sum(opcode_counter.get(op, 0) for op in INT_ARITH_OPS)
+        counts["bitwise_count"] = sum(opcode_counter.get(op, 0) for op in BITWISE_OPS)
+        counts["shift_count"] = sum(opcode_counter.get(op, 0) for op in SHIFT_OPS)
 
         # FP arithmetic
-        fp_arith = sum(opcode_counter.get(op, 0) for op in FP_ARITH_OPS)
-        features["fp_arith_count"] = fp_arith
+        counts["fp_arith_count"] = sum(opcode_counter.get(op, 0) for op in FP_ARITH_OPS)
 
         # Comparisons
-        features["icmp_count"] = opcode_counter.get("icmp", 0)
-        features["fcmp_count"] = opcode_counter.get("fcmp", 0)
+        counts["icmp_count"] = opcode_counter.get("icmp", 0)
+        counts["fcmp_count"] = opcode_counter.get("fcmp", 0)
 
         # Memory
-        features["load_count"] = opcode_counter.get("load", 0)
-        features["store_count"] = opcode_counter.get("store", 0)
-        features["gep_count"] = opcode_counter.get("getelementptr", 0)
-        features["alloca_count"] = opcode_counter.get("alloca", 0)
+        counts["load_count"] = opcode_counter.get("load", 0)
+        counts["store_count"] = opcode_counter.get("store", 0)
+        counts["gep_count"] = opcode_counter.get("getelementptr", 0)
+        counts["alloca_count"] = opcode_counter.get("alloca", 0)
 
         # SSA
-        features["phi_count"] = opcode_counter.get("phi", 0)
+        counts["phi_count"] = opcode_counter.get("phi", 0)
 
         # Calls (total)
-        features["call_count"] = opcode_counter.get("call", 0) + opcode_counter.get("invoke", 0)
+        counts["call_count"] = opcode_counter.get("call", 0) + opcode_counter.get("invoke", 0)
 
         # Casts
-        cast_count = sum(opcode_counter.get(op, 0) for op in CAST_OPS)
-        features["cast_count"] = cast_count
+        counts["cast_count"] = sum(opcode_counter.get(op, 0) for op in CAST_OPS)
 
         # Control flow
-        features["select_count"] = opcode_counter.get("select", 0)
-        features["ret_count"] = opcode_counter.get("ret", 0)
-        features["invoke_count"] = opcode_counter.get("invoke", 0)
-        features["switch_count"] = opcode_counter.get("switch", 0)
+        counts["select_count"] = opcode_counter.get("select", 0)
+        counts["ret_count"] = opcode_counter.get("ret", 0)
+        counts["invoke_count"] = opcode_counter.get("invoke", 0)
+        counts["switch_count"] = opcode_counter.get("switch", 0)
 
-        # Branches: conditional vs unconditional
+        # Branches: conditional ("br i1 %c, label %a, label %b") versus
+        # unconditional ("br label %a")
         cond_br = 0
         uncond_br = 0
         for op, line in self.instructions:
             if op == "br":
-                if "i1" in line:
+                if line.startswith("br i1 "):
                     cond_br += 1
                 else:
                     uncond_br += 1
-        features["cond_br_count"] = cond_br
-        features["uncond_br_count"] = uncond_br
+        counts["cond_br_count"] = cond_br
+        counts["uncond_br_count"] = uncond_br
 
         # -- Structural features --
-        bb_count = len(self.basic_blocks)
-        if self.func_name == "phi_heavy":
-            bb_count = 5
-        features["bb_count"] = bb_count
+        counts["bb_count"] = len(self.basic_blocks)
 
         # CFG edges
-        features["cfg_edges"] = len(self.cfg_edges)
+        counts["cfg_edges"] = len(self.cfg_edges)
 
         # Predecessor / successor distributions
-        pred_count = Counter()  # label -> number of predecessors
-        succ_count = Counter()  # label -> number of successors
+        pred_count = Counter()  # label -> number of incoming edges
+        succ_count = Counter()  # label -> number of outgoing edges
         for src, dst in self.cfg_edges:
             pred_count[dst] += 1
             succ_count[src] += 1
 
         # Blocks by predecessor count
-        all_labels = set(label for label, _ in self.basic_blocks)
-        features["blocks_1_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) == 1)
-        features["blocks_2_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) == 2)
-        features["blocks_gt2_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) > 2)
+        all_labels = [label for label, _ in self.basic_blocks]
+        counts["blocks_1_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) == 1)
+        counts["blocks_2_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) == 2)
+        counts["blocks_gt2_pred"] = sum(1 for l in all_labels if pred_count.get(l, 0) > 2)
 
         # Blocks by successor count
-        features["blocks_1_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) == 1)
-        features["blocks_2_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) == 2)
-        features["blocks_gt2_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) > 2)
+        counts["blocks_1_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) == 1)
+        counts["blocks_2_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) == 2)
+        counts["blocks_gt2_succ"] = sum(1 for l in all_labels if succ_count.get(l, 0) > 2)
 
         # Phi arguments total
-        features["phi_args_total"] = self.phi_args_total
+        counts["phi_args_total"] = self.phi_args_total
 
         # Constant operands
-        features["const_operands"] = self.const_operands
+        counts["const_operands"] = self.const_operands
 
         # Call classification
-        features["direct_call_count"] = self.direct_calls
-        features["intrinsic_call_count"] = self.intrinsic_calls
-        features["self_recursive_call_count"] = self.self_recursive_calls
-
-        # -- Log instruction count (not normalized) --
-        features["log_inst_count"] = math.log(inst_count + 1)
-        features["inst_count"] = inst_count
+        counts["direct_call_count"] = self.direct_calls
+        counts["intrinsic_call_count"] = self.intrinsic_calls
+        counts["self_recursive_call_count"] = self.self_recursive_calls
 
         # -- Density features (count / instruction_count) --
-        count_features = [
-            "int_arith_count", "fp_arith_count", "icmp_count", "fcmp_count",
-            "load_count", "store_count", "gep_count", "alloca_count",
-            "phi_count", "call_count", "cast_count", "select_count",
-            "ret_count", "invoke_count", "switch_count",
-            "cond_br_count", "uncond_br_count",
-            "bb_count", "cfg_edges",
-            "blocks_1_pred", "blocks_2_pred", "blocks_gt2_pred",
-            "blocks_1_succ", "blocks_2_succ", "blocks_gt2_succ",
-            "phi_args_total", "const_operands",
-            "direct_call_count", "intrinsic_call_count", "self_recursive_call_count",
-        ]
-        for feat_name in count_features:
-            density_name = feat_name.replace("_count", "_density")
-            if density_name == feat_name:
-                # For features that don't end in _count, append _density
-                density_name = feat_name + "_density"
-            features[density_name] = features[feat_name] / inst_count
+        # "xxx_count" becomes "xxx_density"; names without "_count" get
+        # "_density" appended.  Every density therefore ends in "_density".
+        for count_name, value in counts.items():
+            if count_name.endswith("_count"):
+                density_name = count_name[: -len("_count")] + "_density"
+            else:
+                density_name = count_name + "_density"
+            features[density_name] = value / inst_count
+
+        # -- Size features (not divided by the instruction count) --
+        features["log_inst_count"] = math.log(inst_count + 1)
 
         # Mean and max instructions per basic block
-        bb_inst_counts = [len(insts) for label, insts in self.basic_blocks]
-        features["mean_insts_per_bb"] = inst_count / max(len(bb_inst_counts), 1)
-        features["max_insts_per_bb"] = float(max(bb_inst_counts)) if bb_inst_counts else 0.0
+        bb_sizes = {label: len(insts) for label, insts in self.basic_blocks}
+        features["mean_insts_per_bb"] = inst_count / max(len(bb_sizes), 1)
+        features["max_insts_per_bb"] = float(max(bb_sizes.values())) if bb_sizes else 0.0
 
-        # Compute loop header and body sizes based on backward edges
-        # A backward edge is an edge from block B to block A where A appears before B.
-        bb_indices = {label: i for i, (label, insts) in enumerate(self.basic_blocks)}
-        loop_header_sizes = []
-        loop_body_sizes = []
-
-        for src, dst in self.cfg_edges:
-            if src in bb_indices and dst in bb_indices:
-                src_idx = bb_indices[src]
-                dst_idx = bb_indices[dst]
-                if dst_idx <= src_idx:  # Backward edge (or self loop)
-                    # dst is the loop header
-                    header_size = len(self.basic_blocks[dst_idx][1])
-                    loop_header_sizes.append(header_size)
-
-                    # Approximate loop body size as sum of block sizes from dst to src
-                    body_size = sum(len(self.basic_blocks[i][1]) for i in range(dst_idx, src_idx + 1))
-                    loop_body_sizes.append(body_size)
-
-        max_loop_header = max(loop_header_sizes) if loop_header_sizes else 0
-        innermost_body_size = min(loop_body_sizes) if loop_body_sizes else 0
-
-        features["max_loop_header_size"] = float(max_loop_header)
-        features["innermost_loop_body_size"] = float(innermost_body_size)
-
-        # Remove raw count features (keep densities and log_inst_count)
-        for feat in count_features + ["inst_count"]:
-            features.pop(feat, None)
+        # -- Loop features, from LLVM's own LoopInfo (exact, not guessed) --
+        if loops is not None:
+            features.update(self._loop_features(loops, bb_sizes, inst_count))
 
         return features
+
+    def _loop_features(self, loops: List[dict], bb_sizes: Dict[str, int],
+                       inst_count: int) -> Dict[str, float]:
+        """
+        Turn LoopInfo's list of loops into features.
+
+          loop_count_density       number of loops / instruction count
+          max_loop_depth           deepest nesting level (0 = no loops)
+          max_loop_header_size     instructions in the largest loop header
+          min_loop_header_size     instructions in the smallest loop header
+          innermost_loop_body_size instructions in the smallest innermost
+                                   loop (all of its blocks added together)
+
+        All sizes are 0 when the function has no loops.
+        A loop is "innermost" when no other loop's header is among its blocks.
+        """
+        out = {}
+        out["loop_count_density"] = len(loops) / inst_count
+        out["max_loop_depth"] = float(max((lp["depth"] for lp in loops), default=0))
+
+        header_sizes = []
+        innermost_body_sizes = []
+        all_headers = set(lp["header"] for lp in loops)
+
+        for lp in loops:
+            # Every block LoopInfo names must exist in our parse; if not, the
+            # two parsers disagree and the loop sizes would be wrong.
+            missing = [b for b in lp["blocks"] if b not in bb_sizes]
+            if missing:
+                raise ValueError(
+                    f"LoopInfo names blocks that the IR parser did not find "
+                    f"in {self.func_name}: {missing[:5]}")
+
+            header_sizes.append(bb_sizes[lp["header"]])
+
+            # Innermost loop: contains no other loop's header
+            other_headers_inside = (set(lp["blocks"]) & all_headers) - {lp["header"]}
+            if not other_headers_inside:
+                innermost_body_sizes.append(sum(bb_sizes[b] for b in lp["blocks"]))
+
+        out["max_loop_header_size"] = float(max(header_sizes, default=0))
+        out["min_loop_header_size"] = float(min(header_sizes, default=0))
+        out["innermost_loop_body_size"] = float(min(innermost_body_sizes, default=0))
+        return out
+
+
+def reachable_counts(ir_text: str, func_name: Optional[str] = None) -> Tuple[int, int]:
+    """
+    Count the instructions and basic blocks that are reachable from the
+    entry block, using OUR parse of the blocks and branch targets.
+
+    LLVM's own function-properties analysis counts reachable blocks only,
+    so this is the number to compare against LLVM when validating the
+    parser.  (Labels use the total count, which also includes dead blocks.)
+    Returns (reachable_instructions, reachable_blocks).
+    """
+    extractor = IRFeatureExtractor(ir_text, func_name)
+    if not extractor.basic_blocks:
+        return 0, 0
+    sizes = {label: len(insts) for label, insts in extractor.basic_blocks}
+    successors = defaultdict(set)
+    for src, dst in extractor.cfg_edges:
+        successors[src].add(dst)
+
+    # Walk the control-flow graph from the entry block (the first block)
+    entry = extractor.basic_blocks[0][0]
+    visited = set([entry])
+    work = [entry]
+    while work:
+        block = work.pop()
+        for nxt in successors[block]:
+            if nxt not in visited and nxt in sizes:
+                visited.add(nxt)
+                work.append(nxt)
+    return sum(sizes[b] for b in visited), len(visited)
 
 
 # ============================================================================
 # Loop analysis using opt
 # ============================================================================
 
+def parse_loop_info(loop_output: str) -> List[dict]:
+    """
+    Parse the text printed by `opt -passes='print<loops>'`.
+
+    Each loop is one line, for example:
+        Loop at depth 2 containing: %15<header><exiting>,%17,%22,%45<latch>
+    Returns a list of dicts: {"depth": 2, "header": "15", "blocks": ["15", ...]}
+    """
+    loops = []
+    for line in loop_output.splitlines():
+        match = re.search(r"Loop at depth (\d+) containing: (.*)$", line)
+        if not match:
+            continue
+        depth = int(match.group(1))
+        blocks = []
+        header = None
+        for item in match.group(2).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            # Split "%15<header><exiting>" into the name and its tags
+            name = item.split("<")[0].strip()
+            if name.startswith("%"):
+                name = name[1:]
+            # Quoted names are printed as %"name"
+            if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+                name = name[1:-1]
+            blocks.append(name)
+            if "<header>" in item:
+                header = name
+        if header is None and blocks:
+            header = blocks[0]   # LoopInfo always prints the header first
+        loops.append({"depth": depth, "header": header, "blocks": blocks})
+    return loops
+
+
+def run_noop_with_loops(ir_text: str, tools: dict, timeout: int = 10) -> Tuple[str, List[dict]]:
+    """
+    Run opt once with only the loop printer.  One process gives us both:
+      - the IR re-printed by opt with NO transformation (the "no-op" text
+        that pass outputs are compared against to decide "fired")
+      - LoopInfo for the loop features
+    Raises CalledProcessError / TimeoutExpired on failure (never guesses).
+    """
+    cmd = [tools["opt"], "-passes=print<loops>", "-S"]
+    result = run_tool(cmd, timeout=timeout, check=True, input_data=ir_text)
+    return result.stdout, parse_loop_info(result.stderr)
+
+
 def get_loop_info(ll_file: Optional[Path], tools: dict, ir_text: Optional[str] = None) -> Tuple[int, int]:
     """
-    Use `opt -passes='print<loops>'` to get loop count and max depth.
-    Returns (loop_count, max_loop_depth).
-    Falls back to (0, 0) on failure.
+    Loop count and maximum loop depth for a file or IR text.
+    Kept for callers that only need these two numbers.
+    Raises on failure instead of returning a made-up (0, 0).
     """
-    cmd = [tools["opt"], "-passes=print<loops>", "-disable-output", "-S"]
-    if ll_file and ll_file.exists():
-        cmd.append(str(ll_file))
-        input_data = None
-    elif ir_text is not None:
-        input_data = ir_text
-    else:
-        return 0, 0
-
-    try:
-        result = run_tool(cmd, timeout=10, check=True, input_data=input_data)
-        output = result.stderr + result.stdout
-    except subprocess.CalledProcessError:
-        return 0, 0
-    except subprocess.TimeoutExpired:
-        return 0, 0
-
-    loop_count = 0
-    max_depth = 0
-    for line in output.splitlines():
-        match = re.search(r"Loop at depth (\d+)", line)
-        if match:
-            loop_count += 1
-            depth = int(match.group(1))
-            max_depth = max(max_depth, depth)
-
-    return loop_count, max_depth
+    if ir_text is None:
+        if ll_file is None or not ll_file.exists():
+            raise FileNotFoundError(f"No IR given for loop analysis: {ll_file}")
+        ir_text = read_ir_file(ll_file)
+    _, loops = run_noop_with_loops(ir_text, tools)
+    return len(loops), max((lp["depth"] for lp in loops), default=0)
 
 
 # ============================================================================
@@ -497,22 +546,9 @@ def extract_features_for_file(ll_file: Path, tools: dict,
                                func_name: Optional[str] = None) -> Optional[Dict]:
     """Extract features from a single .ll file."""
     ir_text = read_ir_file(ll_file)
-    extractor = IRFeatureExtractor(ir_text, func_name)
-    features = extractor.extract_features()
+    features = extract_features_from_ir_text(ir_text, tools, func_name=func_name)
+    return features if features else None
 
-    if not features:
-        return None
-
-    # Add loop info from opt
-    loop_count, max_depth = get_loop_info(ll_file, tools)
-    features["loop_count"] = loop_count
-    features["max_loop_depth"] = max_depth
-
-    # Density for loop count (NOT for max depth)
-    inst_count = features.get("inst_count", 1)
-    features["loop_count_density"] = loop_count / inst_count
-
-    return features
 
 def run_phase2(smoke: bool = False):
     """Extract features for all functions in the function index."""
@@ -585,25 +621,18 @@ def run_phase2(smoke: bool = False):
 
 def extract_features_from_ir_text(ir_text: str, tools: dict,
                                     ll_file: Optional[Path] = None,
-                                    func_name: Optional[str] = None) -> Dict:
+                                    func_name: Optional[str] = None,
+                                    loops: Optional[List[dict]] = None) -> Dict:
     """
-    Extract features from IR text string.
-    If ll_file is provided, also extracts loop info via opt.
+    Extract the full feature vector from IR text.
+
+    loops: LoopInfo already parsed for this IR (saves one opt call).
+           If None, opt is run here to get it.
     """
+    if loops is None:
+        _, loops = run_noop_with_loops(ir_text, tools)
     extractor = IRFeatureExtractor(ir_text, func_name)
-    features = extractor.extract_features()
-
-    loop_count, max_depth = get_loop_info(ll_file, tools, ir_text=ir_text)
-    features["loop_count"] = loop_count
-    features["max_loop_depth"] = max_depth
-    inst_count = features.get("inst_count", 1)
-    if inst_count == 0:
-        inst_count = 1
-    features["loop_count_density"] = loop_count / inst_count
-    # Remove inst_count
-    features.pop("inst_count", None)
-
-    return features
+    return extractor.extract_features(loops=loops)
 
 
 # ============================================================================
