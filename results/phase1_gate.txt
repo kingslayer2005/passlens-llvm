@@ -2,10 +2,10 @@
 ╔══════════════════════════════════════════════════╗
 ║            PHASE 1 GATE REPORT                   ║
 ╠══════════════════════════════════════════════════╣
-║ Programs processed:          3                   ║
-║ Total functions (≥10i):     12                   ║
-║ Unique functions:           12                   ║
-║ Duplicates removed:          0                   ║
-║ Compilation failures:        0                   ║
+║ Programs processed:         52                   ║
+║ Total functions (≥10i):    854                   ║
+║ Unique functions:          819                   ║
+║ Duplicates removed:         35                   ║
+║ Compilation failures:      742                   ║
 ║ Extraction failures:         0                   ║
 ╚══════════════════════════════════════════════════╝

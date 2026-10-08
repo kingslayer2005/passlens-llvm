@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-phase5_shap.py — TreeSHAP explainability analysis (core contribution).
+phase5_shap.py — TreeSHAP explainability analysis (v2 — research upgrades).
 
-For each interpretable pass:
-  1. TreeSHAP on held-out folds only.
-  2. Per pass: mean |SHAP| ranking, beeswarm, dependence plots (top 5),
-     interaction values for top pairs, 3 local waterfall case studies.
-  3. Faithfulness checks:
-     a. Rank stability across folds and 5 seeds (Kendall τ, top-10 overlap)
-     b. Agreement with permutation importance
-     c. Label-shuffle control (rankings must collapse)
-  4. Group correlated features (Spearman |ρ| > 0.8, hierarchical clustering)
-     and report SHAP at cluster level.
-  5. Heuristic agreement scoring (hit@5, MRR, direction agreement) against
-     heuristics.yaml. Compare to random-ranking null.
-  6. Identify candidate novel drivers (top SHAP features NOT in heuristic table).
+Upgrades:
+  1. Both tree_path_dependent and interventional SHAP (background <= 200)
+  2. Rank agreement (Kendall tau) between the two
+  3. Stability: Kendall tau across 3 repeats x 5 folds
+  4. Interpret only if: model beats majority (after Holm) AND stability tau >= 0.6
+  5. Interaction values on <= 500 samples, top 10 pairs only
+  6. Faithfulness: remove top-k SHAP features (k=1,3,5,10), retrain, compare
+     with k random features (20 random draws)
+  7. Size confound: SHAP ranking without log_inst_count
+  8. Heuristic agreement: permutation test (10K random rankings), Holm-corrected,
+     bootstrap CIs for hit@5 and MRR
+  9. Never save raw SHAP arrays — only aggregated tables and final figures
 
 Output:
-  results/figures/shap_*            — SHAP plots (300 dpi)
-  results/shap_rankings.csv         — per-pass feature importance rankings
-  results/faithfulness.csv          — faithfulness check results
-  results/heuristic_agreement.csv   — heuristic agreement scores
-  results/novel_drivers.csv         — candidate novel feature drivers
-  results/phase5_gate.txt           — gate report
-
-Usage:
-  python -m scripts.phase5_shap [--smoke]
+  results/shap_rankings.csv
+  results/shap_dual_method.csv
+  results/faithfulness.csv
+  results/size_confound.csv
+  results/heuristic_agreement.csv
+  results/interaction_top10.csv
+  results/novel_drivers.csv
+  results/figures/shap_*
 """
 
 import argparse
@@ -36,138 +34,151 @@ import warnings
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for saving figures
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.utils import (
     PROJECT_ROOT, DATA_DIR, FEATURES_DIR, LABELS_DIR, RESULTS_DIR, FIGURES_DIR,
-    ensure_dirs, setup_logging,
+    ensure_dirs, setup_logging, check_disk_space,
 )
 
 log = setup_logging("phase5")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ============================================================================
-# Figure settings
-# ============================================================================
 DPI = 300
 plt.rcParams.update({
-    "figure.dpi": DPI,
-    "savefig.dpi": DPI,
-    "font.size": 10,
-    "axes.titlesize": 12,
-    "figure.figsize": (10, 6),
+    "figure.dpi": DPI, "savefig.dpi": DPI,
+    "font.size": 10, "axes.titlesize": 12, "figure.figsize": (10, 6),
 })
 
+N_REPEATS = 3
+N_FOLDS = 5
+STABILITY_TAU_THRESHOLD = 0.6
+MAX_INTERACTION_SAMPLES = 500
+MAX_BACKGROUND_SAMPLES = 200
+FAITHFULNESS_K = [1, 3, 5, 10]
+N_RANDOM_DRAWS = 20
+N_PERM_TEST = 10000
+N_BOOTSTRAP = 10000
+
 
 # ============================================================================
-# SHAP analysis per pass
+# Dual SHAP (tree_path_dependent + interventional)
 # ============================================================================
 
-def compute_shap_for_pass(pass_name: str, df_merged, feature_cols: list,
-                           n_seeds: int = 5) -> dict:
+def compute_shap_for_pass(pass_name, target_name, df_merged, feature_cols):
     """
-    Compute TreeSHAP values for a pass across folds and seeds.
-    Returns a dict with SHAP values, rankings, and stability metrics.
+    Compute SHAP across 3x5 repeated SGKFold on held-out data.
+    Compute both tree_path_dependent and interventional SHAP.
+    Returns aggregated results dict (no raw arrays saved).
     """
-    import pandas as pd
     import shap
-    from scipy.stats import kendalltau, spearmanr
+    from scipy.stats import kendalltau
     from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
 
     pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+    if target_name == "harmful":
+        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
+        y_col = "harmful"
+    else:
+        y_col = "beneficial"
+
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df["beneficial"].values.astype(int)
+    y = pass_df[y_col].values.astype(int)
     groups = pass_df["program"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(5, len(set(groups)))
+    n_splits = min(N_FOLDS, len(set(groups)))
     if n_splits < 2:
-        log.warning("Not enough groups for SHAP on %s", pass_name)
         return None
 
-    # Collect SHAP values across folds and seeds
-    all_shap_values = []       # list of (n_test, n_features) arrays
-    all_X_test = []
-    rankings_per_seed = []     # list of feature importance rankings per seed
+    # Collect per-fold mean|SHAP| rankings for stability
+    rankings_tpd = []  # tree_path_dependent rankings per fold
+    rankings_int = []  # interventional rankings per fold
+    all_mean_abs_tpd = []
+    all_mean_abs_int = []
+    # Keep one representative set for plots (first fold)
+    plot_shap = None
+    plot_X = None
 
-    for seed in range(n_seeds):
-        gkf = StratifiedGroupKFold(n_splits=n_splits)
-        seed_shap_values = []
-        seed_X_test = []
-
+    for rep in range(N_REPEATS):
+        gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
+                                     random_state=42 + rep)
         for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
             if len(set(y_test)) < 2 or len(set(y_train)) < 2:
-                msg = f"Fold {fold_idx} for pass {pass_name} skipped in SHAP (single class in train/test)."
-                log.warning(msg)
-                with open(RESULTS_DIR / "skipped_folds.txt", "a") as f:
-                    f.write(msg + "\n")
                 continue
+
+            n_pos = int(y_train.sum())
+            n_neg = len(y_train) - n_pos
+            spw = n_neg / max(n_pos, 1)
 
             model = XGBClassifier(
                 n_estimators=200, max_depth=6, learning_rate=0.1,
                 subsample=0.8, colsample_bytree=0.8,
-                random_state=42 + seed, eval_metric="logloss",
-                use_label_encoder=False,
+                scale_pos_weight=spw,
+                random_state=42 + rep, eval_metric="logloss",
             )
             model.fit(X_train, y_train)
 
-            # TreeSHAP on held-out fold
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_test)
+            # tree_path_dependent SHAP
+            explainer_tpd = shap.TreeExplainer(model)
+            sv_tpd = explainer_tpd.shap_values(X_test)
+            mean_abs_tpd = np.mean(np.abs(sv_tpd), axis=0)
+            all_mean_abs_tpd.append(mean_abs_tpd)
+            rankings_tpd.append(np.argsort(-mean_abs_tpd))
 
-            seed_shap_values.append(shap_values)
-            seed_X_test.append(X_test)
+            if plot_shap is None:
+                plot_shap = sv_tpd
+                plot_X = X_test
 
-        if seed_shap_values:
-            combined = np.vstack(seed_shap_values)
-            all_shap_values.append(combined)
-            all_X_test.append(np.vstack(seed_X_test))
+            # interventional SHAP (background <= 200 train samples)
+            bg_size = min(MAX_BACKGROUND_SAMPLES, len(X_train))
+            bg_idx = np.random.RandomState(42).choice(len(X_train), bg_size, replace=False)
+            background = X_train[bg_idx]
+            try:
+                explainer_int = shap.TreeExplainer(model, data=background,
+                                                    feature_perturbation="interventional")
+                sv_int = explainer_int.shap_values(X_test)
+                mean_abs_int = np.mean(np.abs(sv_int), axis=0)
+                all_mean_abs_int.append(mean_abs_int)
+                rankings_int.append(np.argsort(-mean_abs_int))
+            except Exception as e:
+                log.warning("Interventional SHAP failed for %s: %s", pass_name, e)
 
-            # Ranking for this seed: by mean |SHAP|
-            mean_abs = np.mean(np.abs(combined), axis=0)
-            ranking = np.argsort(-mean_abs)  # descending
-            rankings_per_seed.append(ranking)
-
-    if not all_shap_values:
+    if not all_mean_abs_tpd:
         return None
 
-    # ---- Aggregate SHAP values ----
-    # Use the first seed's values for plotting (representative)
-    primary_shap = all_shap_values[0]
-    primary_X = all_X_test[0]
-
-    # Mean |SHAP| ranking across all seeds
-    all_mean_abs = []
-    for sv in all_shap_values:
-        all_mean_abs.append(np.mean(np.abs(sv), axis=0))
-    global_mean_abs = np.mean(all_mean_abs, axis=0)
+    # Global ranking (tree_path_dependent)
+    global_mean_abs = np.mean(all_mean_abs_tpd, axis=0)
     global_ranking = np.argsort(-global_mean_abs)
 
-    # ---- Rank stability (Kendall τ, top-10 overlap) ----
-    kendall_taus = []
-    top10_overlaps = []
-    for i in range(len(rankings_per_seed)):
-        for j in range(i + 1, len(rankings_per_seed)):
-            tau, _ = kendalltau(rankings_per_seed[i], rankings_per_seed[j])
-            kendall_taus.append(tau)
+    # Stability: Kendall tau across all TPD rankings
+    taus = []
+    for i in range(len(rankings_tpd)):
+        for j in range(i + 1, len(rankings_tpd)):
+            tau, _ = kendalltau(rankings_tpd[i], rankings_tpd[j])
+            taus.append(tau)
+    stability_tau = float(np.mean(taus)) if taus else float("nan")
 
-            top10_i = set(rankings_per_seed[i][:10])
-            top10_j = set(rankings_per_seed[j][:10])
-            overlap = len(top10_i & top10_j) / 10.0
-            top10_overlaps.append(overlap)
+    # TPD vs interventional rank agreement
+    dual_tau = float("nan")
+    if all_mean_abs_int:
+        global_int = np.mean(all_mean_abs_int, axis=0)
+        global_int_ranking = np.argsort(-global_int)
+        tau_dual, _ = kendalltau(global_ranking, global_int_ranking)
+        dual_tau = float(tau_dual)
 
-    # ---- Feature importance ranking ----
+    # Feature importance ranking table
     ranking_info = []
     for rank, feat_idx in enumerate(global_ranking):
         ranking_info.append({
-            "pass_name": pass_name,
+            "pass_name": pass_name, "target": target_name,
             "rank": rank + 1,
             "feature": feature_cols[feat_idx],
             "mean_abs_shap": round(float(global_mean_abs[feat_idx]), 6),
@@ -175,345 +186,465 @@ def compute_shap_for_pass(pass_name: str, df_merged, feature_cols: list,
 
     return {
         "pass_name": pass_name,
-        "primary_shap": primary_shap,
-        "primary_X": primary_X,
+        "target": target_name,
         "global_ranking": global_ranking,
         "global_mean_abs": global_mean_abs,
         "ranking_info": ranking_info,
-        "kendall_tau_mean": float(np.mean(kendall_taus)) if kendall_taus else float("nan"),
-        "kendall_tau_std": float(np.std(kendall_taus)) if kendall_taus else float("nan"),
-        "top10_overlap_mean": float(np.mean(top10_overlaps)) if top10_overlaps else float("nan"),
+        "stability_tau": stability_tau,
+        "dual_tau": dual_tau,
         "feature_cols": feature_cols,
-        "n_samples": len(primary_shap),
+        "plot_shap": plot_shap,
+        "plot_X": plot_X,
     }
 
 
 # ============================================================================
-# Faithfulness checks
+# Interaction values
 # ============================================================================
 
-def permutation_importance_agreement(pass_name: str, df_merged, feature_cols: list) -> dict:
-    """
-    Compute permutation importance and compare with SHAP ranking.
-    """
-    import pandas as pd
-    from scipy.stats import kendalltau
-    from sklearn.inspection import permutation_importance
+def compute_interactions(pass_name, target_name, df_merged, feature_cols):
+    """Compute interaction values on at most 500 held-out samples, keep top 10 pairs."""
+    import shap
     from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
 
-    pass_df = df_merged[df_merged["pass_name"] == pass_name]
+    pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+    if target_name == "harmful":
+        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
+        y_col = "harmful"
+    else:
+        y_col = "beneficial"
+
     X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df["beneficial"].values.astype(int)
+    y = pass_df[y_col].values.astype(int)
     groups = pass_df["program"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(5, len(set(groups)))
+    n_splits = min(N_FOLDS, len(set(groups)))
     if n_splits < 2:
-        return {"pass_name": pass_name, "perm_kendall_tau": float("nan")}
+        return []
 
     gkf = StratifiedGroupKFold(n_splits=n_splits)
-    # Use first fold
+    train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train = y[train_idx]
+
+    if len(set(y_train)) < 2:
+        return []
+
+    # Subsample test set
+    if len(X_test) > MAX_INTERACTION_SAMPLES:
+        rng = np.random.RandomState(42)
+        sel = rng.choice(len(X_test), MAX_INTERACTION_SAMPLES, replace=False)
+        X_test = X_test[sel]
+
+    n_pos = int(y_train.sum())
+    n_neg = len(y_train) - n_pos
+    model = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        scale_pos_weight=n_neg / max(n_pos, 1),
+        random_state=42, eval_metric="logloss",
+    )
+    model.fit(X_train, y_train)
+
+    try:
+        explainer = shap.TreeExplainer(model)
+        interaction_values = explainer.shap_interaction_values(X_test)
+        # interaction_values shape: (n_samples, n_features, n_features)
+        # Mean absolute interaction
+        mean_interactions = np.mean(np.abs(interaction_values), axis=0)
+        # Zero the diagonal (self-interactions)
+        np.fill_diagonal(mean_interactions, 0)
+
+        # Top 10 pairs
+        n_feat = mean_interactions.shape[0]
+        pairs = []
+        for i in range(n_feat):
+            for j in range(i + 1, n_feat):
+                pairs.append((i, j, mean_interactions[i, j]))
+        pairs.sort(key=lambda x: -x[2])
+
+        results = []
+        for i, j, val in pairs[:10]:
+            results.append({
+                "pass_name": pass_name, "target": target_name,
+                "feature_1": feature_cols[i],
+                "feature_2": feature_cols[j],
+                "mean_abs_interaction": round(float(val), 6),
+            })
+        # Do NOT save raw interaction array
+        del interaction_values
+        return results
+    except Exception as e:
+        log.warning("Interaction values failed for %s: %s", pass_name, e)
+        return []
+
+
+# ============================================================================
+# Faithfulness: feature removal test
+# ============================================================================
+
+def faithfulness_test(pass_name, target_name, df_merged, feature_cols, global_ranking):
+    """
+    Remove top-k SHAP features, retrain, compare PR-AUC drop vs removing
+    k random features (20 random draws).
+    """
+    from sklearn.metrics import average_precision_score
+    from sklearn.model_selection import StratifiedGroupKFold
+    from xgboost import XGBClassifier
+
+    pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+    if target_name == "harmful":
+        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
+        y_col = "harmful"
+    else:
+        y_col = "beneficial"
+
+    X = pass_df[feature_cols].values.astype(np.float32)
+    y = pass_df[y_col].values.astype(int)
+    groups = pass_df["program"].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    n_splits = min(N_FOLDS, len(set(groups)))
+    if n_splits < 2:
+        return []
+
+    gkf = StratifiedGroupKFold(n_splits=n_splits)
     train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
-    model = XGBClassifier(
-        n_estimators=200, max_depth=6, learning_rate=0.1,
-        random_state=42, eval_metric="logloss", use_label_encoder=False,
-    )
-    model.fit(X_train, y_train)
+    if len(set(y_test)) < 2 or len(set(y_train)) < 2:
+        return []
 
-    perm_result = permutation_importance(
-        model, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1
-    )
-    perm_ranking = np.argsort(-perm_result.importances_mean)
+    n_pos = int(y_train.sum())
+    n_neg = len(y_train) - n_pos
+    spw = n_neg / max(n_pos, 1)
+    n_features = X.shape[1]
 
-    # Compare with SHAP ranking
-    import shap
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
-    shap_mean_abs = np.mean(np.abs(shap_values), axis=0)
-    shap_ranking = np.argsort(-shap_mean_abs)
+    def train_and_score(keep_mask):
+        m = XGBClassifier(
+            n_estimators=200, max_depth=6, learning_rate=0.1,
+            scale_pos_weight=spw, random_state=42, eval_metric="logloss",
+        )
+        m.fit(X_train[:, keep_mask], y_train)
+        yp = m.predict_proba(X_test[:, keep_mask])[:, 1]
+        return average_precision_score(y_test, yp)
 
-    tau, _ = kendalltau(shap_ranking, perm_ranking)
+    # Full model baseline
+    full_score = train_and_score(np.ones(n_features, dtype=bool))
 
-    return {
-        "pass_name": pass_name,
-        "perm_kendall_tau": round(float(tau), 4),
-    }
+    results = []
+    rng = np.random.RandomState(42)
+
+    for k in FAITHFULNESS_K:
+        if k >= n_features:
+            continue
+
+        # Remove top-k SHAP features
+        remove_idx = set(global_ranking[:k])
+        keep_mask = np.array([i not in remove_idx for i in range(n_features)])
+        shap_score = train_and_score(keep_mask)
+
+        # Remove k random features (20 draws)
+        random_scores = []
+        for draw in range(N_RANDOM_DRAWS):
+            rand_remove = set(rng.choice(n_features, k, replace=False))
+            keep_mask_r = np.array([i not in rand_remove for i in range(n_features)])
+            random_scores.append(train_and_score(keep_mask_r))
+
+        results.append({
+            "pass_name": pass_name, "target": target_name,
+            "k": k,
+            "full_prauc": round(full_score, 4),
+            "shap_removed_prauc": round(shap_score, 4),
+            "shap_drop": round(full_score - shap_score, 4),
+            "random_removed_prauc_mean": round(float(np.mean(random_scores)), 4),
+            "random_removed_prauc_std": round(float(np.std(random_scores)), 4),
+            "random_drop_mean": round(float(full_score - np.mean(random_scores)), 4),
+        })
+
+    return results
 
 
-def label_shuffle_control(pass_name: str, df_merged, feature_cols: list) -> dict:
+# ============================================================================
+# Size confound
+# ============================================================================
+
+def size_confound_analysis(pass_name, target_name, df_merged, feature_cols, original_ranking):
     """
-    Shuffle labels and check that SHAP rankings collapse (become random).
+    Remove log_inst_count and recompute SHAP ranking.
+    Report how top-10 changes.
     """
     import shap
-    from scipy.stats import kendalltau
     from sklearn.model_selection import StratifiedGroupKFold
     from xgboost import XGBClassifier
 
-    pass_df = df_merged[df_merged["pass_name"] == pass_name]
-    X = pass_df[feature_cols].values.astype(np.float32)
-    y = pass_df["beneficial"].values.astype(int)
+    if "log_inst_count" not in feature_cols:
+        return []
+
+    reduced_cols = [c for c in feature_cols if c != "log_inst_count"]
+    reduced_idx = [feature_cols.index(c) for c in reduced_cols]
+
+    pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
+    if target_name == "harmful":
+        pass_df["harmful"] = (pass_df["outcome"] == "increased").astype(int)
+        y_col = "harmful"
+    else:
+        y_col = "beneficial"
+
+    X_full = pass_df[feature_cols].values.astype(np.float32)
+    X = X_full[:, reduced_idx]
+    y = pass_df[y_col].values.astype(int)
     groups = pass_df["program"].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_splits = min(5, len(set(groups)))
+    n_splits = min(N_FOLDS, len(set(groups)))
     if n_splits < 2:
-        return {"pass_name": pass_name, "shuffle_shap_max": float("nan")}
-
-    # Shuffle labels
-    rng = np.random.RandomState(99)
-    y_shuffled = rng.permutation(y)
+        return []
 
     gkf = StratifiedGroupKFold(n_splits=n_splits)
-    train_idx, test_idx = next(iter(gkf.split(X, y_shuffled, groups)))
+    train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train = y[train_idx]
 
+    if len(set(y_train)) < 2:
+        return []
+
+    n_pos = int(y_train.sum())
+    n_neg = len(y_train) - n_pos
     model = XGBClassifier(
         n_estimators=200, max_depth=6, learning_rate=0.1,
-        random_state=42, eval_metric="logloss", use_label_encoder=False,
+        scale_pos_weight=n_neg / max(n_pos, 1),
+        random_state=42, eval_metric="logloss",
     )
-    model.fit(X[train_idx], y_shuffled[train_idx])
+    model.fit(X_train, y_train)
 
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X[test_idx])
-    shap_mean_abs = np.mean(np.abs(shap_values), axis=0)
+    sv = explainer.shap_values(X_test)
+    mean_abs = np.mean(np.abs(sv), axis=0)
+    new_ranking = np.argsort(-mean_abs)
 
-    return {
-        "pass_name": pass_name,
-        "shuffle_shap_max": round(float(np.max(shap_mean_abs)), 6),
-        "shuffle_shap_mean": round(float(np.mean(shap_mean_abs)), 6),
-    }
+    # Compare top-10
+    orig_top10 = [feature_cols[i] for i in original_ranking[:10]]
+    new_top10 = [reduced_cols[i] for i in new_ranking[:10]]
+
+    results = []
+    for rank, feat in enumerate(new_top10):
+        orig_rank = orig_top10.index(feat) + 1 if feat in orig_top10 else -1
+        results.append({
+            "pass_name": pass_name, "target": target_name,
+            "feature": feat,
+            "rank_without_size": rank + 1,
+            "rank_with_size": orig_rank if orig_rank > 0 else "N/A",
+        })
+
+    return results
 
 
 # ============================================================================
-# Feature correlation clustering
+# Heuristic agreement with permutation test
 # ============================================================================
 
-def cluster_correlated_features(df_merged, feature_cols: list,
-                                  threshold: float = 0.8) -> dict:
+def heuristic_agreement_permutation(shap_result, heuristics, feature_cols, df_merged):
     """
-    Group correlated features (Spearman |ρ| > threshold) using hierarchical clustering.
-    Returns a mapping: cluster_id -> list of feature names.
-    """
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import squareform
-    from scipy.stats import spearmanr
-
-    X = df_merged[feature_cols].values.astype(np.float64)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Compute Spearman correlation matrix
-    rho, _ = spearmanr(X)
-    if rho.ndim == 0:
-        return {0: feature_cols}
-
-    # Convert correlation to distance
-    dist = 1 - np.abs(rho)
-    dist = np.nan_to_num(dist, nan=1.0)
-    dist = (dist + dist.T) / 2.0
-    np.fill_diagonal(dist, 0)
-    dist = np.clip(dist, 0, 1)
-
-    # Hierarchical clustering
-    condensed = squareform(dist)
-    Z = linkage(condensed, method="average")
-    clusters = fcluster(Z, t=1 - threshold, criterion="distance")
-
-    cluster_map = {}
-    for feat_idx, cluster_id in enumerate(clusters):
-        cluster_id = int(cluster_id)
-        if cluster_id not in cluster_map:
-            cluster_map[cluster_id] = []
-        cluster_map[cluster_id].append(feature_cols[feat_idx])
-
-    return cluster_map
-
-
-def shap_at_cluster_level(shap_values: np.ndarray, feature_cols: list,
-                           cluster_map: dict) -> dict:
-    """Aggregate SHAP values at cluster level by summing member features."""
-    cluster_shap = {}
-    for cluster_id, members in cluster_map.items():
-        member_indices = [feature_cols.index(f) for f in members if f in feature_cols]
-        if member_indices:
-            cluster_shap_vals = np.sum(np.abs(shap_values[:, member_indices]), axis=1)
-            cluster_shap[cluster_id] = {
-                "members": members,
-                "mean_abs_shap": float(np.mean(cluster_shap_vals)),
-            }
-    return cluster_shap
-
-
-# ============================================================================
-# Heuristic agreement
-# ============================================================================
-
-def score_heuristic_agreement(shap_result: dict, heuristics: dict) -> dict:
-    """
-    Score agreement between SHAP rankings and heuristics.yaml.
-    Computes: hit@5, MRR, direction agreement.
-    Compares to random-ranking null.
+    Score agreement + permutation test (10K random rankings), bootstrap CIs.
+    Includes cross-pass control. Uses correlated feature clusters.
     """
     pass_name = shap_result["pass_name"]
-    feature_cols = shap_result["feature_cols"]
+    target = shap_result["target"]
     ranking = shap_result["global_ranking"]
-    shap_values = shap_result["primary_shap"]
-
-    if pass_name not in heuristics:
-        return {"pass_name": pass_name, "hit_at_5": None, "mrr": None}
-
-    heuristic_features = heuristics[pass_name].get("features", [])
-    heuristic_names = set(f["name"] for f in heuristic_features)
-    heuristic_directions = {f["name"]: f["direction"] for f in heuristic_features}
-
-    # Ranked feature names
-    ranked_names = [feature_cols[i] for i in ranking]
-
-    # hit@5: fraction of heuristic features in top 5
-    top5 = set(ranked_names[:5])
-    hits = len(heuristic_names & top5)
-    hit_at_5 = hits / len(heuristic_names) if heuristic_names else 0.0
-
-    # MRR: mean reciprocal rank of heuristic features
-    reciprocal_ranks = []
-    for hf in heuristic_names:
-        if hf in ranked_names:
-            rank = ranked_names.index(hf) + 1
-            reciprocal_ranks.append(1.0 / rank)
-        else:
-            reciprocal_ranks.append(0.0)
-    mrr = float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
-
-    # Direction agreement: does SHAP direction match expected direction?
-    direction_matches = 0
-    direction_total = 0
-    for hf_info in heuristic_features:
-        feat_name = hf_info["name"]
-        expected_dir = hf_info["direction"]  # "high" or "low"
-
-        if feat_name in feature_cols:
-            feat_idx = feature_cols.index(feat_name)
-            # Compute correlation between SHAP values and feature values
-            shap_col = shap_values[:, feat_idx]
-            # Positive mean SHAP = high value -> beneficial
-            mean_shap = np.mean(shap_col)
-
-            if expected_dir == "high" and mean_shap > 0:
-                direction_matches += 1
-            elif expected_dir == "low" and mean_shap < 0:
-                direction_matches += 1
-            direction_total += 1
-
-    direction_agreement = direction_matches / direction_total if direction_total > 0 else float("nan")
-
-    # Random baseline: expected hit@5 under random ranking
     n_features = len(feature_cols)
-    random_hit_at_5 = min(5, len(heuristic_names)) / n_features if n_features > 0 else 0
-    random_mrr = np.mean([1.0 / ((n_features + 1) / 2)] * len(heuristic_names)) if heuristic_names else 0
+    ranked_names = [feature_cols[i] for i in ranking]
+    
+    # Compute correlated feature clusters (|rho| > 0.8)
+    corr_matrix = df_merged[feature_cols].corr(method='spearman').abs()
+    clusters = {} # feature -> set of equivalent features
+    for f in feature_cols:
+        clusters[f] = set(corr_matrix.columns[corr_matrix[f] > 0.8])
 
-    return {
-        "pass_name": pass_name,
-        "hit_at_5": round(hit_at_5, 4),
-        "mrr": round(mrr, 4),
-        "direction_agreement": round(direction_agreement, 4) if direction_total > 0 else None,
-        "random_hit_at_5": round(random_hit_at_5, 4),
-        "random_mrr": round(random_mrr, 4),
-        "n_heuristic_features": len(heuristic_names),
-    }
+    results = []
 
+    for h_type in ["applicability", "cost_model"]:
+        # Get own heuristic names
+        def get_heur_names(p_name):
+            if p_name not in heuristics:
+                return set()
+            h_list = heuristics[p_name].get(h_type, [])
+            return set(f["name"] for f in h_list if target in f)
+            
+        own_names = get_heur_names(pass_name)
+        if not own_names:
+            continue
 
-def find_novel_drivers(shap_result: dict, heuristics: dict, top_n: int = 10) -> list:
-    """
-    Find top SHAP features that are NOT in the heuristic table.
-    These are candidate novel drivers to investigate.
-    """
-    pass_name = shap_result["pass_name"]
-    feature_cols = shap_result["feature_cols"]
-    ranking = shap_result["global_ranking"]
+        def score_agreement(names_set, r_names):
+            if not names_set:
+                return 0.0, 0.0
+            
+            # Expand names_set to include correlated features
+            expanded_names = set()
+            for name in names_set:
+                expanded_names.update(clusters.get(name, {name}))
 
-    if pass_name not in heuristics:
-        heuristic_names = set()
-    else:
-        heuristic_names = set(f["name"] for f in heuristics[pass_name].get("features", []))
+            top5 = set(r_names[:5])
+            hit5 = len(expanded_names & top5) / max(len(names_set), 1) # denom is original expected count
+            hit5 = min(hit5, 1.0) # cap at 1
+            
+            rrs = []
+            for hf in names_set:
+                # Find the best rank among all features correlated to hf
+                eq_features = clusters.get(hf, {hf})
+                best_rank = len(r_names)
+                for ef in eq_features:
+                    if ef in r_names:
+                        rank = r_names.index(ef)
+                        if rank < best_rank:
+                            best_rank = rank
+                if best_rank < len(r_names):
+                    rrs.append(1.0 / (best_rank + 1))
+                else:
+                    rrs.append(0.0)
+            mrr = float(np.mean(rrs)) if rrs else 0.0
+            return hit5, mrr
 
-    novel = []
-    for idx in ranking[:top_n]:
-        feat_name = feature_cols[idx]
-        if feat_name not in heuristic_names:
-            novel.append({
-                "pass_name": pass_name,
-                "feature": feat_name,
-                "shap_rank": int(np.where(ranking == idx)[0][0]) + 1,
-                "mean_abs_shap": round(float(shap_result["global_mean_abs"][idx]), 6),
-            })
-    return novel
+        own_hit5, own_mrr = score_agreement(own_names, ranked_names)
+
+        # Cross-pass control
+        other_passes = [p for p in heuristics if p != pass_name]
+        other_hit5s = []
+        other_mrrs = []
+        for op in other_passes:
+            op_names = get_heur_names(op)
+            if op_names:
+                h, m = score_agreement(op_names, ranked_names)
+                other_hit5s.append(h)
+                other_mrrs.append(m)
+                
+        mean_other_hit5 = float(np.mean(other_hit5s)) if other_hit5s else 0.0
+        mean_other_mrr = float(np.mean(other_mrrs)) if other_mrrs else 0.0
+        beats_others = (own_hit5 > mean_other_hit5) or (own_mrr > mean_other_mrr)
+
+        # Permutation test
+        rng = np.random.RandomState(42)
+        null_hit5 = []
+        null_mrr = []
+        for _ in range(N_PERM_TEST):
+            perm = rng.permutation(n_features)
+            perm_names = [feature_cols[i] for i in perm]
+            nh5, nmrr = score_agreement(own_names, perm_names)
+            null_hit5.append(nh5)
+            null_mrr.append(nmrr)
+
+        p_hit5 = float(np.mean(np.array(null_hit5) >= own_hit5))
+        p_mrr = float(np.mean(np.array(null_mrr) >= own_mrr))
+
+        # Bootstrap CIs
+        boot_hit5 = []
+        boot_mrr = []
+        heur_list = list(own_names)
+        for _ in range(N_BOOTSTRAP):
+            boot_heur = [heur_list[i] for i in rng.choice(len(heur_list), len(heur_list), replace=True)]
+            boot_set = set(boot_heur)
+            bh5, bmrr = score_agreement(boot_set, ranked_names)
+            boot_hit5.append(bh5)
+            boot_mrr.append(bmrr)
+
+        results.append({
+            "pass_name": pass_name,
+            "target": target,
+            "heuristic_type": h_type,
+            "hit_at_5": round(own_hit5, 4),
+            "hit_at_5_ci_lo": round(float(np.percentile(boot_hit5, 2.5)), 4),
+            "hit_at_5_ci_hi": round(float(np.percentile(boot_hit5, 97.5)), 4),
+            "hit_at_5_p": round(p_hit5, 6),
+            "mrr": round(own_mrr, 4),
+            "mrr_ci_lo": round(float(np.percentile(boot_mrr, 2.5)), 4),
+            "mrr_ci_hi": round(float(np.percentile(boot_mrr, 97.5)), 4),
+            "mrr_p": round(p_mrr, 6),
+            "cross_pass_mean_hit5": round(mean_other_hit5, 4),
+            "cross_pass_mean_mrr": round(mean_other_mrr, 4),
+            "beats_others": beats_others,
+            "n_heuristic_features": len(own_names),
+        })
+
+    return results
 
 
 # ============================================================================
 # Plotting
 # ============================================================================
 
-def plot_beeswarm(shap_values, X, feature_names, pass_name, save_dir):
-    """Generate a SHAP beeswarm plot."""
+def plot_beeswarm(shap_values, X, feature_names, pass_name, target, save_dir):
     import shap
     fig = plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values, X, feature_names=feature_names,
                       show=False, max_display=20)
-    plt.title(f"SHAP Beeswarm — {pass_name}")
+    plt.title(f"SHAP Beeswarm — {pass_name} ({target})")
     plt.tight_layout()
-    plt.savefig(save_dir / f"shap_beeswarm_{pass_name}.png", dpi=DPI, bbox_inches="tight")
+    plt.savefig(save_dir / f"shap_beeswarm_{pass_name}_{target}.png",
+                dpi=DPI, bbox_inches="tight")
     plt.close()
 
-
-def plot_dependence(shap_values, X, feature_names, pass_name, top_features, save_dir):
-    """Generate SHAP dependence plots for top 5 features."""
+def threshold_analysis(pass_name, target_name, df, feature_cols, shap_result, heuristics, save_dir):
     import shap
-    for feat_name in top_features[:5]:
-        if feat_name not in feature_names:
-            continue
-        feat_idx = feature_names.index(feat_name)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        shap.dependence_plot(
-            feat_idx, shap_values, X,
-            feature_names=feature_names,
-            show=False, ax=ax,
-        )
-        ax.set_title(f"SHAP Dependence — {pass_name} — {feat_name}")
-        plt.tight_layout()
-        plt.savefig(save_dir / f"shap_dep_{pass_name}_{feat_name}.png",
-                    dpi=DPI, bbox_inches="tight")
-        plt.close()
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
 
+    if pass_name not in heuristics:
+        return []
+    
+    results = []
+    shap_vals = shap_result["plot_shap"]
+    X = shap_result["plot_X"]
 
-def plot_waterfall_cases(shap_values, X, feature_names, pass_name, save_dir,
-                          n_cases: int = 3):
-    """Generate waterfall plots for representative local explanations."""
-    import shap
+    for h in heuristics[pass_name].get("cost_model", []):
+        if h.get("direction") == "threshold" and h["name"] in feature_cols:
+            feat = h["name"]
+            feat_idx = feature_cols.index(feat)
+            rank = shap_result["global_ranking"].index(feat_idx) + 1
+            default_thresh = h.get("threshold", np.nan)
+            
+            # Dependence plot
+            try:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                shap.dependence_plot(feat, shap_vals, X, show=False, ax=ax)
+                if not pd.isna(default_thresh):
+                    ax.axvline(x=default_thresh, color='r', linestyle='--', label=f'LLVM Default ({default_thresh})')
+                    ax.legend()
+                plt.title(f"SHAP Dependence: {pass_name} - {feat}")
+                plt.tight_layout()
+                plt.savefig(save_dir / f"shap_dependence_{pass_name}_{target_name}_{feat}.png", dpi=DPI, bbox_inches="tight")
+                plt.close(fig)
+            except Exception as e:
+                log.warning("Dependence plot failed for %s: %s", feat, e)
+            
+            # Find crossover
+            x_vals = X[feat].values
+            s_vals = shap_vals[:, feat_idx]
+            df_t = pd.DataFrame({"x": x_vals, "shap": s_vals}).sort_values("x")
+            
+            # Smooth SHAP values to find general trend crossover
+            df_t["smoothed_shap"] = df_t["shap"].rolling(window=max(1, len(df_t)//20), min_periods=1, center=True).mean()
+            crossover = np.nan
+            
+            # Simple sign change detection
+            signs = np.sign(df_t["smoothed_shap"].values)
+            sign_changes = np.where(signs[:-1] != signs[1:])[0]
+            if len(sign_changes) > 0:
+                # take the most prominent one (closest to 0)
+                idx = sign_changes[0]
+                crossover = df_t.iloc[idx]["x"]
 
-    # Pick cases with diverse predictions: highest SHAP sum, lowest, and median
-    shap_sums = np.sum(shap_values, axis=1)
-    indices = [
-        int(np.argmax(shap_sums)),
-        int(np.argmin(shap_sums)),
-        int(np.argsort(shap_sums)[len(shap_sums) // 2]),
-    ]
-
-    for case_idx, sample_idx in enumerate(indices[:n_cases]):
-        explanation = shap.Explanation(
-            values=shap_values[sample_idx],
-            base_values=0,  # approximate
-            data=X[sample_idx],
-            feature_names=feature_names,
-        )
-        fig = plt.figure(figsize=(10, 6))
-        plot_path = save_dir / f"shap_waterfall_{pass_name}_case{case_idx + 1}.png"
-        shap.plots.waterfall(explanation, show=False, max_display=15)
-        plt.title(f"SHAP Waterfall — {pass_name} — Case {case_idx + 1}")
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=DPI, bbox_inches="tight")
-        plt.close()
+            results.append({
+                "pass_name": pass_name,
+                "target": target_name,
+                "feature": feat,
+                "shap_rank": rank,
+                "default_threshold": default_thresh,
+                "crossover_x": crossover
+            })
+    return results
 
 
 # ============================================================================
@@ -522,11 +653,11 @@ def plot_waterfall_cases(shap_values, X, feature_names, pass_name, save_dir,
 
 def run_phase5(smoke: bool = False):
     """Execute Phase 5: SHAP explainability analysis."""
+    check_disk_space()
     ensure_dirs()
     import pandas as pd
     import yaml
 
-    # Load data
     features_path = FEATURES_DIR / "features.csv"
     labels_path = LABELS_DIR / "labels.csv"
     interp_path = LABELS_DIR / "interpretable_passes.json"
@@ -535,20 +666,18 @@ def run_phase5(smoke: bool = False):
 
     for p in [features_path, labels_path]:
         if not p.exists():
-            log.error("Required file not found: %s — run earlier phases first.", p)
+            log.error("Required file not found: %s", p)
             sys.exit(1)
 
     df_features = pd.read_csv(features_path)
     df_labels = pd.read_csv(labels_path)
 
-    # Load interpretable passes
     if interp_path.exists():
         with open(interp_path) as f:
             interp_passes = json.load(f)
     else:
         interp_passes = list(df_labels["pass_name"].unique())
 
-    # Load feature columns
     if feature_cols_path.exists():
         with open(feature_cols_path) as f:
             feature_cols = json.load(f)
@@ -556,139 +685,230 @@ def run_phase5(smoke: bool = False):
         feature_cols = [c for c in df_features.columns
                         if c not in {"suite", "program", "function", "ir_hash", "inst_count"}]
 
-    # Merge
     df_merged = pd.merge(
-        df_labels,
-        df_features,
+        df_labels, df_features,
         on=["ir_hash", "suite", "program", "function"],
         how="inner",
     )
     feature_cols = [c for c in feature_cols if c in df_merged.columns]
 
-    # Load heuristics
     heuristics = {}
     if heuristics_path.exists():
         with open(heuristics_path) as f:
             heuristics = yaml.safe_load(f) or {}
 
-    log.info("Phase 5: analyzing %d interpretable passes", len(interp_passes))
+    # Determine active targets
+    target_status_path = LABELS_DIR / "target_status.json"
+    active_targets = ["beneficial"]
+    if target_status_path.exists():
+        with open(target_status_path) as f:
+            ts = json.load(f)
+            for key, val in ts.items():
+                if val == "kept" and key.endswith("_harmful"):
+                    if "harmful" not in active_targets:
+                        active_targets.append("harmful")
 
-    # Create figures subdirectory
+    # Validate heuristics against feature matrix
+    missing_features = set()
+    for pass_name, h_data in heuristics.items():
+        for h_type in ["applicability", "cost_model"]:
+            for feat_entry in h_data.get(h_type, []):
+                feat_name = feat_entry.get("name")
+                if feat_name and feat_name not in feature_cols:
+                    missing_features.add(feat_name)
+    if missing_features:
+        log.error("Feature names in heuristics.yaml missing from feature matrix: %s", missing_features)
+        sys.exit(1)
+
+    log.info("Phase 5: analyzing %d passes, targets: %s", len(interp_passes), active_targets)
+
     shap_fig_dir = FIGURES_DIR / "shap"
     shap_fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Compute SHAP for each pass ----
     all_rankings = []
+    all_dual = []
     all_faithfulness = []
-    all_heuristic_scores = []
-    all_novel_drivers = []
-    all_cluster_shap = []
+    all_interactions = []
+    all_heuristic = []
+    all_novel = []
+    all_size_confound = []
+    all_threshold = []
 
-    # Feature correlation clustering (once, shared across passes)
-    cluster_map = cluster_correlated_features(df_merged, feature_cols)
-    log.info("Feature clusters: %d clusters from %d features",
-             len(cluster_map), len(feature_cols))
+    # Load Wilcoxon results to check which passes beat majority
+    wilcoxon_path = RESULTS_DIR / "phase4_wilcoxon.csv"
+    beats_majority = set()
+    if wilcoxon_path.exists():
+        df_wilcox = pd.read_csv(wilcoxon_path)
+        for _, row in df_wilcox.iterrows():
+            if row.get("baseline") == "majority" and row.get("significant", False):
+                beats_majority.add((row["pass_name"], row["target"]))
 
     for pass_name in interp_passes:
-        log.info("=== SHAP analysis for pass: %s ===", pass_name)
+        for target_name in active_targets:
+            key = (pass_name, target_name)
 
-        # 1. Compute SHAP
-        shap_result = compute_shap_for_pass(pass_name, df_merged, feature_cols)
-        if shap_result is None:
-            log.warning("SHAP computation failed for %s, skipping.", pass_name)
-            continue
+            log.info("=== SHAP: %s / %s ===", pass_name, target_name)
 
-        # Rankings
-        all_rankings.extend(shap_result["ranking_info"])
+            shap_result = compute_shap_for_pass(pass_name, target_name, df_merged, feature_cols)
+            if shap_result is None:
+                log.warning("SHAP failed for %s/%s", pass_name, target_name)
+                continue
 
-        # 2. Plots
-        top_features = [feature_cols[i] for i in shap_result["global_ranking"][:5]]
-        log.info("  Top 5 features: %s", top_features)
+            # Check interpretability criteria
+            stable = shap_result["stability_tau"] >= STABILITY_TAU_THRESHOLD
+            beats = key in beats_majority
+            interpret = stable and beats
 
-        plot_beeswarm(shap_result["primary_shap"], shap_result["primary_X"],
-                      feature_cols, pass_name, shap_fig_dir)
-        plot_dependence(shap_result["primary_shap"], shap_result["primary_X"],
-                        feature_cols, pass_name, top_features, shap_fig_dir)
-        plot_waterfall_cases(shap_result["primary_shap"], shap_result["primary_X"],
-                             feature_cols, pass_name, shap_fig_dir)
+            all_rankings.extend(shap_result["ranking_info"])
 
-        # 3. Faithfulness checks
-        faith = {
-            "pass_name": pass_name,
-            "kendall_tau_mean": shap_result["kendall_tau_mean"],
-            "kendall_tau_std": shap_result["kendall_tau_std"],
-            "top10_overlap_mean": shap_result["top10_overlap_mean"],
-        }
-
-        perm = permutation_importance_agreement(pass_name, df_merged, feature_cols)
-        faith["perm_kendall_tau"] = perm["perm_kendall_tau"]
-
-        shuffle = label_shuffle_control(pass_name, df_merged, feature_cols)
-        faith["shuffle_shap_max"] = shuffle["shuffle_shap_max"]
-        faith["shuffle_shap_mean"] = shuffle["shuffle_shap_mean"]
-
-        all_faithfulness.append(faith)
-
-        # 4. Cluster-level SHAP
-        cl_shap = shap_at_cluster_level(
-            shap_result["primary_shap"], feature_cols, cluster_map
-        )
-        for cl_id, cl_info in cl_shap.items():
-            all_cluster_shap.append({
-                "pass_name": pass_name,
-                "cluster_id": cl_id,
-                "members": "; ".join(cl_info["members"]),
-                "mean_abs_shap": cl_info["mean_abs_shap"],
+            all_dual.append({
+                "pass_name": pass_name, "target": target_name,
+                "stability_tau": round(shap_result["stability_tau"], 4),
+                "dual_method_tau": round(shap_result["dual_tau"], 4),
+                "beats_majority": beats,
+                "stable": stable,
+                "interpretable": interpret,
             })
 
-        # 5. Heuristic agreement
-        agreement = score_heuristic_agreement(shap_result, heuristics)
-        all_heuristic_scores.append(agreement)
+            if not interpret:
+                log.info("  %s/%s NOT interpretable (stable=%s, beats=%s)",
+                         pass_name, target_name, stable, beats)
+                continue
 
-        # 6. Novel drivers
-        novel = find_novel_drivers(shap_result, heuristics)
-        all_novel_drivers.extend(novel)
+            log.info("  Top 5: %s", [feature_cols[i] for i in shap_result["global_ranking"][:5]])
 
-    # ---- Save results ----
+            # Plot beeswarm
+            if shap_result["plot_shap"] is not None:
+                plot_beeswarm(shap_result["plot_shap"], shap_result["plot_X"],
+                              feature_cols, pass_name, target_name, shap_fig_dir)
+
+            # Threshold analysis
+            t_res = threshold_analysis(pass_name, target_name, df_merged, feature_cols, shap_result, heuristics, shap_fig_dir)
+            all_threshold.extend(t_res)
+
+            # Interaction values
+            interact = compute_interactions(pass_name, target_name, df_merged, feature_cols)
+            all_interactions.extend(interact)
+
+            # Faithfulness
+            faith = faithfulness_test(pass_name, target_name, df_merged, feature_cols,
+                                      shap_result["global_ranking"])
+            all_faithfulness.extend(faith)
+
+            # Size confound
+            sc = size_confound_analysis(pass_name, target_name, df_merged, feature_cols,
+                                        shap_result["global_ranking"])
+            all_size_confound.extend(sc)
+
+            # Heuristic agreement
+            ha = heuristic_agreement_permutation(shap_result, heuristics, feature_cols, df_merged)
+            if ha:
+                all_heuristic.extend(ha)
+
+            # Novel drivers
+            heur_names = set()
+            if pass_name in heuristics:
+                for h_type in ["applicability", "cost_model"]:
+                    h_list = heuristics[pass_name].get(h_type, [])
+                    heur_names.update(f["name"] for f in h_list if target_name in f)
+            for rank, feat_idx in enumerate(shap_result["global_ranking"][:10]):
+                feat = feature_cols[feat_idx]
+                if feat not in heur_names:
+                    all_novel.append({
+                        "pass_name": pass_name, "target": target_name,
+                        "feature": feat,
+                        "shap_rank": rank + 1,
+                        "mean_abs_shap": round(float(shap_result["global_mean_abs"][feat_idx]), 6),
+                    })
+
+    # ---- Save all results ----
     if all_rankings:
-        pd.DataFrame(all_rankings).to_csv(
-            RESULTS_DIR / "shap_rankings.csv", index=False)
+        pd.DataFrame(all_rankings).to_csv(RESULTS_DIR / "shap_rankings.csv", index=False)
+    if all_dual:
+        pd.DataFrame(all_dual).to_csv(RESULTS_DIR / "shap_dual_method.csv", index=False)
     if all_faithfulness:
-        pd.DataFrame(all_faithfulness).to_csv(
-            RESULTS_DIR / "faithfulness.csv", index=False)
-    if all_heuristic_scores:
-        pd.DataFrame(all_heuristic_scores).to_csv(
-            RESULTS_DIR / "heuristic_agreement.csv", index=False)
-    if all_novel_drivers:
-        pd.DataFrame(all_novel_drivers).to_csv(
-            RESULTS_DIR / "novel_drivers.csv", index=False)
-    if all_cluster_shap:
-        pd.DataFrame(all_cluster_shap).to_csv(
-            RESULTS_DIR / "cluster_shap.csv", index=False)
+        pd.DataFrame(all_faithfulness).to_csv(RESULTS_DIR / "faithfulness.csv", index=False)
+    if all_interactions:
+        pd.DataFrame(all_interactions).to_csv(RESULTS_DIR / "interaction_top10.csv", index=False)
+    if all_threshold:
+        pd.DataFrame(all_threshold).to_csv(RESULTS_DIR / "threshold_analysis.csv", index=False)
+    if all_heuristic:
+        df_ha = pd.DataFrame(all_heuristic)
+        # Holm correction on p-values across passes
+        from scripts.phase4_models import holm_bonferroni
+        if len(df_ha) > 1:
+            df_ha["hit_at_5_p_holm"] = holm_bonferroni(df_ha["hit_at_5_p"].tolist())
+            df_ha["mrr_p_holm"] = holm_bonferroni(df_ha["mrr_p"].tolist())
+        else:
+            df_ha["hit_at_5_p_holm"] = df_ha["hit_at_5_p"]
+            df_ha["mrr_p_holm"] = df_ha["mrr_p"]
+        df_ha.to_csv(RESULTS_DIR / "heuristic_agreement.csv", index=False)
+    if all_novel:
+        pd.DataFrame(all_novel).to_csv(RESULTS_DIR / "novel_drivers.csv", index=False)
+    if all_size_confound:
+        pd.DataFrame(all_size_confound).to_csv(RESULTS_DIR / "size_confound.csv", index=False)
+        
+    # ---- Pooled Heuristic Agreement Test ----
+    # Pool all expected features across passes/targets
+    pooled_obs = []
+    pooled_nulls = np.zeros(10000)
+    
+    for r_entry in all_rankings:
+        p_name = r_entry["pass_name"]
+        t_name = r_entry["target"]
+        ranking = r_entry["global_ranking"]
+        ranked_names = [feature_cols[i] for i in ranking]
+        n_feat = len(ranked_names)
+        
+        expected_features = set()
+        if p_name in heuristics:
+            for h_type in ["applicability", "cost_model"]:
+                h_list = heuristics[p_name].get(h_type, [])
+                expected_features.update(f["name"] for f in h_list if t_name in f)
+        
+        expected_features = expected_features.intersection(ranked_names)
+        if not expected_features:
+            continue
+            
+        # Percentile rank: 0 (worst) to 1 (best)
+        for hf in expected_features:
+            obs_rank = ranked_names.index(hf)
+            pooled_obs.append((n_feat - 1 - obs_rank) / max(n_feat - 1, 1))
+            
+        # Permutation nulls
+        for idx in range(10000):
+            perm = np.random.permutation(n_feat)
+            for hf in expected_features:
+                null_rank = int(perm[ranked_names.index(hf)]) # simulate random position
+                pooled_nulls[idx] += ((n_feat - 1 - null_rank) / max(n_feat - 1, 1))
 
-    # Save cluster map
-    cluster_path = RESULTS_DIR / "feature_clusters.json"
-    with open(cluster_path, "w") as f:
-        json.dump(cluster_map, f, indent=2)
+    if len(pooled_obs) > 0:
+        obs_mean = np.mean(pooled_obs)
+        pooled_nulls /= len(pooled_obs) # mean across all features
+        p_val = (np.sum(pooled_nulls >= obs_mean) + 1) / (10000 + 1)
+        pooled_df = pd.DataFrame([{
+            "n_expected_features_total": len(pooled_obs),
+            "mean_percentile_rank": obs_mean,
+            "permutation_p_value": p_val
+        }])
+        pooled_df.to_csv(RESULTS_DIR / "pooled_heuristic_agreement.csv", index=False)
 
-    # ---- Gate report ----
+
+    # Gate report
+    n_interpretable = sum(1 for d in all_dual if d.get("interpretable", False))
     report = f"""
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 5 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
 ║ Passes analyzed:        {len(interp_passes):>8}                     ║
-║ Feature clusters:       {len(cluster_map):>8}                     ║
-║ Novel driver candidates:{len(all_novel_drivers):>8}                     ║
+║ Targets:                {len(active_targets):>8}                     ║
+║ Interpretable (pass):   {n_interpretable:>8}                     ║
+║ Stability threshold:     tau>={STABILITY_TAU_THRESHOLD}                     ║
 ╚══════════════════════════════════════════════════════╝
 """
     log.info(report)
-    gate_path = RESULTS_DIR / "phase5_gate.txt"
-    gate_path.write_text(report, encoding='utf-8')
+    (RESULTS_DIR / "phase5_gate.txt").write_text(report, encoding='utf-8')
 
-
-# ============================================================================
-# CLI
-# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 5: SHAP Explainability")

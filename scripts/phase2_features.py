@@ -413,6 +413,40 @@ class IRFeatureExtractor:
                 density_name = feat_name + "_density"
             features[density_name] = features[feat_name] / inst_count
 
+        # Mean and max instructions per basic block
+        bb_inst_counts = [len(insts) for label, insts in self.basic_blocks]
+        features["mean_insts_per_bb"] = inst_count / max(len(bb_inst_counts), 1)
+        features["max_insts_per_bb"] = float(max(bb_inst_counts)) if bb_inst_counts else 0.0
+
+        # Compute loop header and body sizes based on backward edges
+        # A backward edge is an edge from block B to block A where A appears before B.
+        bb_indices = {label: i for i, (label, insts) in enumerate(self.basic_blocks)}
+        loop_header_sizes = []
+        loop_body_sizes = []
+
+        for src, dst in self.cfg_edges:
+            if src in bb_indices and dst in bb_indices:
+                src_idx = bb_indices[src]
+                dst_idx = bb_indices[dst]
+                if dst_idx <= src_idx:  # Backward edge (or self loop)
+                    # dst is the loop header
+                    header_size = len(self.basic_blocks[dst_idx][1])
+                    loop_header_sizes.append(header_size)
+
+                    # Approximate loop body size as sum of block sizes from dst to src
+                    body_size = sum(len(self.basic_blocks[i][1]) for i in range(dst_idx, src_idx + 1))
+                    loop_body_sizes.append(body_size)
+
+        max_loop_header = max(loop_header_sizes) if loop_header_sizes else 0
+        innermost_body_size = min(loop_body_sizes) if loop_body_sizes else 0
+
+        features["max_loop_header_size"] = float(max_loop_header)
+        features["innermost_loop_body_size"] = float(innermost_body_size)
+
+        # Remove raw count features (keep densities and log_inst_count)
+        for feat in count_features + ["inst_count"]:
+            features.pop(feat, None)
+
         return features
 
 
@@ -420,19 +454,28 @@ class IRFeatureExtractor:
 # Loop analysis using opt
 # ============================================================================
 
-def get_loop_info(ll_file: Path, tools: dict) -> Tuple[int, int]:
+def get_loop_info(ll_file: Optional[Path], tools: dict, ir_text: Optional[str] = None) -> Tuple[int, int]:
     """
     Use `opt -passes='print<loops>'` to get loop count and max depth.
     Returns (loop_count, max_loop_depth).
     Falls back to (0, 0) on failure.
     """
-    result = run_tool(
-        [tools["opt"], "-passes=print<loops>", "-disable-output", "-S", str(ll_file)],
-        timeout=10,
-        check=True,
-    )
-    # Loop info is printed to stderr
-    output = result.stderr + result.stdout
+    cmd = [tools["opt"], "-passes=print<loops>", "-disable-output", "-S"]
+    if ll_file and ll_file.exists():
+        cmd.append(str(ll_file))
+        input_data = None
+    elif ir_text is not None:
+        input_data = ir_text
+    else:
+        return 0, 0
+
+    try:
+        result = run_tool(cmd, timeout=10, check=True, input_data=input_data)
+        output = result.stderr + result.stdout
+    except subprocess.CalledProcessError:
+        return 0, 0
+    except subprocess.TimeoutExpired:
+        return 0, 0
 
     loop_count = 0
     max_depth = 0
@@ -465,13 +508,11 @@ def extract_features_for_file(ll_file: Path, tools: dict,
     features["loop_count"] = loop_count
     features["max_loop_depth"] = max_depth
 
-    # Density for loop features
+    # Density for loop count (NOT for max depth)
     inst_count = features.get("inst_count", 1)
     features["loop_count_density"] = loop_count / inst_count
-    features["max_loop_depth_density"] = max_depth / inst_count
 
     return features
-
 
 def run_phase2(smoke: bool = False):
     """Extract features for all functions in the function index."""
@@ -552,18 +593,15 @@ def extract_features_from_ir_text(ir_text: str, tools: dict,
     extractor = IRFeatureExtractor(ir_text, func_name)
     features = extractor.extract_features()
 
-    if ll_file and ll_file.exists():
-        loop_count, max_depth = get_loop_info(ll_file, tools)
-        features["loop_count"] = loop_count
-        features["max_loop_depth"] = max_depth
-        inst_count = features.get("inst_count", 1)
-        features["loop_count_density"] = loop_count / inst_count
-        features["max_loop_depth_density"] = max_depth / inst_count
-    else:
-        features["loop_count"] = 0
-        features["max_loop_depth"] = 0
-        features["loop_count_density"] = 0.0
-        features["max_loop_depth_density"] = 0.0
+    loop_count, max_depth = get_loop_info(ll_file, tools, ir_text=ir_text)
+    features["loop_count"] = loop_count
+    features["max_loop_depth"] = max_depth
+    inst_count = features.get("inst_count", 1)
+    if inst_count == 0:
+        inst_count = 1
+    features["loop_count_density"] = loop_count / inst_count
+    # Remove inst_count
+    features.pop("inst_count", None)
 
     return features
 

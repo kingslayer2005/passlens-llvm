@@ -1,0 +1,5 @@
+program,baseline_O0_sec,O2_sec,custom_seq_sec
+2mm,7.8607,5.0011,6.7261
+atax,0.1841,0.1399,0.1773
+gemm,3.4047,0.9777,2.9036
+syrk,2.5194,1.0876,2.1023

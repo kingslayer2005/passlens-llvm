@@ -1,313 +1,268 @@
 # ============================================================================
 # heuristics.yaml
-# Maps each optimization pass to the IR features and directions that
-# LLVM's own source code or documentation implies are relevant.
-#
-# Format per pass:
-#   <pass_name>:
-#     features:
-#       - name: <feature_name>
-#         direction: "high" | "low"  (high = more of this feature => pass helps)
-#         source: <URL or file:line reference>
-#         verified: true | false
-#     description: <what the pass does>
-#
-# Entries marked verified: false are UNVERIFIED — based on general knowledge
-# of the pass, not traced to a specific line of LLVM source.
+# Features split into applicability (needed to fire) and cost_model (profitability).
+# Directions are given for 'beneficial' (reduces size) and 'harmful' (increases size).
 # ============================================================================
 
 sroa:
-  description: "Scalar Replacement of Aggregates — promotes alloca'd aggregates to SSA registers"
-  features:
+  description: "Scalar Replacement of Aggregates"
+  applicability:
     - name: alloca_density
-      direction: high
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#sroa-scalar-replacement-of-aggregates"
       verified: true
     - name: load_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/SROA.cpp — looks for loads from allocas"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#sroa-scalar-replacement-of-aggregates"
       verified: true
     - name: store_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/SROA.cpp — looks for stores to allocas"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#sroa-scalar-replacement-of-aggregates"
       verified: true
-    - name: gep_density
-      direction: high
-      source: "SROA splits aggregates accessed via GEP"
-      verified: false
+  cost_model: []
 
 instcombine:
-  description: "Instruction Combining — algebraic simplification and strength reduction"
-  features:
+  description: "Instruction Combining"
+  applicability:
     - name: int_arith_density
-      direction: high
-      source: "llvm/lib/Transforms/InstCombine/ — simplifies arithmetic patterns"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#instcombine-combine-instructions-to-form-fewer-simple-instructions"
       verified: true
     - name: cast_density
-      direction: high
-      source: "InstCombine folds redundant casts"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#instcombine-combine-instructions-to-form-fewer-simple-instructions"
       verified: true
-    - name: icmp_density
-      direction: high
-      source: "InstCombine simplifies comparison chains"
-      verified: false
-    - name: select_density
-      direction: high
-      source: "InstCombine folds select instructions"
-      verified: false
+  cost_model: []
 
 simplifycfg:
-  description: "Control Flow Graph Simplification — merges blocks, folds branches"
-  features:
-    - name: bb_count_density
-      direction: high
+  description: "Control Flow Graph Simplification"
+  applicability:
+    - name: bb_density
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#simplifycfg-simplify-the-cfg"
       verified: true
     - name: uncond_br_density
-      direction: high
-      source: "SimplifyCFG merges blocks connected by unconditional branches"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#simplifycfg-simplify-the-cfg"
       verified: true
     - name: cond_br_density
-      direction: high
-      source: "SimplifyCFG folds constant-condition branches"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#simplifycfg-simplify-the-cfg"
       verified: true
-    - name: phi_density
-      direction: high
-      source: "Block merging removes phi nodes"
-      verified: false
+  cost_model: []
 
 early-cse:
   description: "Early Common Subexpression Elimination"
-  features:
-    - name: int_arith_density
-      direction: high
-      source: "EarlyCSE uses hash-based value numbering to eliminate redundant computations"
-      verified: false
+  applicability:
     - name: load_density
-      direction: high
-      source: "EarlyCSE eliminates redundant loads"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#early-cse-early-common-subexpression-elimination"
       verified: true
-    - name: bb_count_density
-      direction: low
-      source: "EarlyCSE is local to extended basic blocks — fewer, larger blocks help"
+    - name: mean_insts_per_bb
+      beneficial: high
+      harmful: low
+      source: "Larger blocks offer more local CSE opportunities"
       verified: false
+  cost_model: []
 
 gvn:
-  description: "Global Value Numbering — eliminates fully and partially redundant computations"
-  features:
+  description: "Global Value Numbering"
+  applicability:
     - name: load_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/GVN.cpp — PRE for loads"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#gvn-global-value-numbering"
       verified: true
-    - name: phi_density
-      direction: high
-      source: "GVN inserts/uses phi nodes for value propagation"
-      verified: true
-    - name: cfg_edges_density
-      direction: high
-      source: "More CFG edges → more redundancy opportunities"
-      verified: false
+  cost_model: []
 
 sccp:
   description: "Sparse Conditional Constant Propagation"
-  features:
+  applicability:
     - name: const_operands_density
-      direction: high
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#sccp-sparse-conditional-constant-propagation"
       verified: true
     - name: cond_br_density
-      direction: high
-      source: "SCCP resolves constant-condition branches"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#sccp-sparse-conditional-constant-propagation"
       verified: true
-    - name: phi_density
-      direction: high
-      source: "SCCP propagates constants through phi nodes"
-      verified: false
+  cost_model: []
 
 adce:
   description: "Aggressive Dead Code Elimination"
-  features:
-    - name: int_arith_density
-      direction: high
-      source: "ADCE removes instructions whose results are unused"
-      verified: false
+  applicability:
     - name: store_density
-      direction: low
-      source: "Stores are usually live (side effects); fewer stores means more removable code"
+      beneficial: low
+      harmful: low
+      source: "Fewer stores implies fewer side effects, meaning more dead code."
       verified: false
     - name: call_density
-      direction: low
-      source: "Calls are usually live; ADCE is most effective without them"
+      beneficial: low
+      harmful: low
+      source: "Fewer calls implies fewer side effects."
       verified: false
+  cost_model: []
 
 dse:
   description: "Dead Store Elimination"
-  features:
+  applicability:
     - name: store_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#dse-dead-store-elimination"
       verified: true
-    - name: load_density
-      direction: high
-      source: "DSE reasons about store-load aliasing"
-      verified: false
-    - name: alloca_density
-      direction: high
-      source: "DSE is most effective for stores to local allocas"
-      verified: false
+  cost_model: []
 
 reassociate:
-  description: "Reassociate Expressions — reorders associative/commutative operators"
-  features:
+  description: "Reassociate Expressions"
+  applicability:
     - name: int_arith_density
-      direction: high
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#reassociate-reassociate-expressions"
       verified: true
-    - name: fp_arith_density
-      direction: high
-      source: "Reassociate works on FP ops with fast-math flags"
-      verified: false
+  cost_model: []
 
 jump-threading:
-  description: "Jump Threading — threads jumps through blocks with known branch conditions"
-  features:
+  description: "Jump Threading"
+  applicability:
     - name: cond_br_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/JumpThreading.cpp"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#jump-threading-jump-threading"
       verified: true
-    - name: phi_density
-      direction: high
-      source: "Jump threading looks at phi nodes to determine branch conditions"
-      verified: true
-    - name: bb_count_density
-      direction: high
-      source: "More blocks means more threading opportunities"
+  cost_model:
+    - name: mean_insts_per_bb
+      direction: threshold
+      threshold: 6
+      option: "jump-threading-threshold"
+      source: "Small blocks are more likely to be threaded without exceeding duplication thresholds"
       verified: false
 
 correlated-propagation:
-  description: "Correlated Value Propagation — uses lazy value info to simplify"
-  features:
+  description: "Correlated Value Propagation"
+  applicability:
     - name: icmp_density
-      direction: high
-      source: "CVP simplifies comparisons using value ranges"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#correlated-propagation-correlated-value-propagation"
       verified: true
-    - name: phi_density
-      direction: high
-      source: "CVP narrows phi node types based on incoming value ranges"
-      verified: false
-    - name: cond_br_density
-      direction: high
-      source: "CVP can fold branches where condition is implied by dominating conditions"
-      verified: false
+  cost_model: []
 
 licm:
   description: "Loop Invariant Code Motion"
-  features:
+  applicability:
     - name: loop_count_density
-      direction: high
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#licm-loop-invariant-code-motion"
       verified: true
     - name: load_density
-      direction: high
-      source: "LICM hoists loop-invariant loads"
+      beneficial: high
+      harmful: high
+      source: "https://llvm.org/docs/Passes.html#licm-loop-invariant-code-motion"
       verified: true
-    - name: int_arith_density
-      direction: high
-      source: "LICM hoists loop-invariant computations"
-      verified: false
+  cost_model: []
 
 loop-rotate:
-  description: "Loop Rotation — converts loops to do-while form"
-  features:
+  description: "Loop Rotation"
+  applicability:
     - name: loop_count_density
-      direction: high
-      source: "llvm/lib/Transforms/Utils/LoopRotationUtils.cpp"
-      verified: true
-    - name: cond_br_density
-      direction: high
-      source: "Loop rotation moves the loop condition to the end"
+      beneficial: high
+      harmful: high
+      source: "Loop rotate requires loops."
       verified: false
-    - name: phi_density
-      direction: high
-      source: "Loop rotation typically introduces additional phi nodes"
+  cost_model:
+    - name: max_loop_header_size
+      direction: threshold
+      threshold: 16
+      option: "rotation-max-header-size"
+      source: "Loop rotate duplicates the header block; small headers are preferred to minimize code growth."
       verified: false
 
 indvars:
   description: "Induction Variable Simplification"
-  features:
+  applicability:
     - name: loop_count_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/IndVarSimplify.cpp"
-      verified: true
+      beneficial: high
+      harmful: high
+      source: "Requires loops."
+      verified: false
     - name: phi_density
-      direction: high
-      source: "Induction variables are represented as phi nodes in loop headers"
-      verified: true
-    - name: icmp_density
-      direction: high
-      source: "IndVars simplifies loop exit conditions (icmp on IV)"
-      verified: true
+      beneficial: high
+      harmful: high
+      source: "Needs phi nodes for IVs."
+      verified: false
+  cost_model: []
 
 loop-deletion:
-  description: "Loop Deletion — removes loops with no side effects"
-  features:
+  description: "Loop Deletion"
+  applicability:
     - name: loop_count_density
-      direction: high
+      beneficial: high
+      harmful: high
       source: "https://llvm.org/docs/Passes.html#loop-deletion-delete-dead-loops"
       verified: true
     - name: store_density
-      direction: low
-      source: "Loops with stores have side effects and cannot be deleted"
+      beneficial: low
+      harmful: low
+      source: "https://llvm.org/docs/Passes.html#loop-deletion-delete-dead-loops"
       verified: true
-    - name: call_density
-      direction: low
-      source: "Loops with calls usually have side effects"
-      verified: false
+  cost_model: []
 
 loop-idiom:
-  description: "Loop Idiom Recognition — detects memset/memcpy patterns"
-  features:
+  description: "Loop Idiom Recognition"
+  applicability:
     - name: loop_count_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp"
-      verified: true
+      beneficial: high
+      harmful: high
+      source: "Requires loops."
+      verified: false
     - name: store_density
-      direction: high
-      source: "Loop idiom recognizes store loops as memset"
-      verified: true
-    - name: load_density
-      direction: high
-      source: "Loop idiom recognizes load+store loops as memcpy"
-      verified: true
+      beneficial: high
+      harmful: high
+      source: "Requires stores for memset/memcpy recognition."
+      verified: false
+  cost_model: []
 
 loop-unroll:
   description: "Loop Unrolling"
-  features:
+  applicability:
     - name: loop_count_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp"
-      verified: true
-    - name: log_inst_count
-      direction: low
-      source: "Unrolling is more likely on small loop bodies"
-      verified: true
-    - name: max_loop_depth_density
-      direction: high
-      source: "Inner loops are preferred unrolling targets"
+      beneficial: high
+      harmful: high
+      source: "Requires loops."
+      verified: false
+  cost_model:
+    - name: innermost_loop_body_size
+      direction: threshold
+      threshold: 0
+      option: "unroll-optsize-threshold"
+      source: "Loop unroll has a size threshold; large bodies are less likely to be fully unrolled or will increase size severely."
       verified: false
 
 tailcallelim:
-  description: "Tail Call Elimination — converts tail-recursive calls to loops"
-  features:
-    - name: self_recursive_call_density
-      direction: high
-      source: "llvm/lib/Transforms/Scalar/TailRecursionElimination.cpp"
-      verified: true
+  description: "Tail Call Elimination"
+  applicability:
     - name: call_density
-      direction: high
-      source: "TailCallElim looks for calls in tail position"
-      verified: true
-    - name: ret_density
-      direction: high
-      source: "TailCallElim checks if call result flows directly to ret"
+      beneficial: high
+      harmful: high
+      source: "Requires calls."
       verified: false
+    - name: self_recursive_call_density
+      beneficial: high
+      harmful: high
+      source: "Commonly targets self-recursive tail calls."
+      verified: false
+  cost_model: []

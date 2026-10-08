@@ -49,6 +49,25 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+MODELS_DIR = DATA_DIR / "models"
+
+
+def check_disk_space(min_free_gb: float = 1.0):
+    """
+    Check free space on the project drive. If below min_free_gb, raise and stop.
+    """
+    import shutil as _shutil
+    total, used, free = _shutil.disk_usage(str(PROJECT_ROOT))
+    free_gb = free / (1024 ** 3)
+    log.info("Disk space: %.1f GB free (%.1f GB used)", free_gb, used / (1024 ** 3))
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"Disk space critically low: {free_gb:.1f} GB free < {min_free_gb} GB minimum. "
+            f"Stopping to prevent data loss."
+        )
+
+
+
 # ============================================================================
 # Logging
 # ============================================================================
@@ -180,6 +199,7 @@ def run_tool(
             for arg in cmd[1:]:
                 arg_str = str(arg)
                 arg_str = re.sub(r'^([a-zA-Z]):[\\/](.*)$', wsl_path, arg_str)
+                arg_str = arg_str.replace('\\', '/')
                 actual_cmd.append(arg_str)
         else:
             actual_cmd = [str(x) for x in cmd]

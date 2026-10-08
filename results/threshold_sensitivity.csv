@@ -1,0 +1,22 @@
+pass_name,threshold,pos_rate,n_samples,top5_shap
+instcombine,0.005,0.875,40,log_inst_count; load_density; gep_density; const_operands_density; icmp_density
+simplifycfg,0.005,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
+early-cse,0.005,0.65,40,gep_density; icmp_density; const_operands_density; int_arith_density; log_inst_count
+gvn,0.005,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+jump-threading,0.005,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
+loop-rotate,0.005,0.0,40,N/A
+indvars,0.005,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+instcombine,0.01,0.875,40,log_inst_count; load_density; gep_density; const_operands_density; icmp_density
+simplifycfg,0.01,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
+early-cse,0.01,0.575,40,int_arith_density; const_operands_density; icmp_density; cast_density; log_inst_count
+gvn,0.01,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+jump-threading,0.01,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
+loop-rotate,0.01,0.0,40,N/A
+indvars,0.01,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+instcombine,0.02,0.675,40,int_arith_density; icmp_density; log_inst_count; fp_arith_density; fcmp_density
+simplifycfg,0.02,0.65,40,log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density
+early-cse,0.02,0.55,40,int_arith_density; icmp_density; load_density; log_inst_count; const_operands_density
+gvn,0.02,0.9,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density
+jump-threading,0.02,0.6,40,log_inst_count; icmp_density; cast_density; load_density; const_operands_density
+loop-rotate,0.02,0.0,40,N/A
+indvars,0.02,0.2,40,log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density

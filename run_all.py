@@ -17,7 +17,9 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -29,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.utils import (
     DATA_DIR, FEATURES_DIR, LABELS_DIR, RESULTS_DIR,
     ensure_dirs, find_llvm_tools, save_env_json, setup_logging,
+    check_disk_space,
 )
 
 log = setup_logging("run_all")
@@ -81,6 +84,13 @@ def run_phase(phase_num: int, smoke: bool = False, force: bool = False,
         log.info("Phase %d: outputs already exist, skipping. Use --force to re-run.",
                  phase_num)
         return True
+
+    # Disk space check before each phase
+    try:
+        check_disk_space(min_free_gb=1.0)
+    except RuntimeError as e:
+        log.error(str(e))
+        return False
 
     log.info("=" * 60)
     log.info("PHASE %d — Starting", phase_num)
@@ -156,7 +166,20 @@ Examples:
                         help="Force re-run even if outputs exist")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Number of parallel jobs for Phase 3")
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Log output to this file as well as stderr")
     args = parser.parse_args()
+
+    # ---- Setup file logging ----
+    if args.log_file:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(args.log_file, mode="a", maxBytes=20*1024*1024, backupCount=1)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logging.getLogger().addHandler(fh)
+        log.addHandler(fh)
 
     # ---- Setup ----
     ensure_dirs()
@@ -180,6 +203,22 @@ Examples:
     # ---- Save environment info ----
     seeds = [42, 43, 44, 45, 46]  # seeds used across the pipeline
     save_env_json(tools, seeds)
+
+    # ---- Freeze heuristics.yaml ----
+    heuristics_path = PROJECT_ROOT / "heuristics.yaml"
+    if heuristics_path.exists():
+        h_text = heuristics_path.read_bytes()
+        h_sha256 = hashlib.sha256(h_text).hexdigest()
+        log.info("heuristics.yaml SHA-256: %s", h_sha256)
+
+        # Store SHA in env.json
+        env_path = PROJECT_ROOT / "env.json"
+        if env_path.exists():
+            with open(env_path) as f:
+                env = json.load(f)
+            env["heuristics_sha256"] = h_sha256
+            with open(env_path, "w") as f:
+                json.dump(env, f, indent=2)
 
     # ---- Run phases ----
     if args.phase:
@@ -208,11 +247,24 @@ Examples:
 
     # ---- Summary ----
     total_elapsed = time.time() - total_start
+
+    # Report disk usage
+    import shutil
+    results_size = sum(f.stat().st_size for f in RESULTS_DIR.rglob("*") if f.is_file())
+    data_size = sum(f.stat().st_size for f in DATA_DIR.rglob("*") if f.is_file())
+    total_size = results_size + data_size
+
     log.info("")
     log.info("╔══════════════════════════════════════════════════════════╗")
     log.info("║   Pipeline complete!                                   ║")
     log.info("║   Total time: %6.0f seconds (%4.1f minutes)             ║",
              total_elapsed, total_elapsed / 60)
+    log.info("║   Results size:  %7.1f MB                              ║",
+             results_size / 1e6)
+    log.info("║   Data size:     %7.1f MB                              ║",
+             data_size / 1e6)
+    log.info("║   Total size:    %7.1f MB                              ║",
+             total_size / 1e6)
     log.info("║   Results: results/RESULTS.md                          ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
 

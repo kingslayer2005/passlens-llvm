@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.utils import RESULTS_DIR, FIGURES_DIR, setup_logging
+from scripts.utils import RESULTS_DIR, FIGURES_DIR, LABELS_DIR, setup_logging
 
 log = setup_logging("results_md")
 
@@ -28,7 +28,7 @@ def generate():
     sections = []
 
     # ---- Header ----
-    sections.append("""# Results
+    sections.append("""# PRELIMINARY: smoke run on 52 programs, not a research result
 
 > **Auto-generated** — all numbers come from CSV files in `results/`.
 > Do not edit manually; re-run `python -m scripts.generate_results_md` instead.
@@ -43,17 +43,12 @@ def generate():
         sections.append(f"```\n{gate1.read_text(encoding='utf-8')}\n```\n")
 
     # ---- Phase 3: Label distribution ----
-    dist_path = RESULTS_DIR.parent / "data" / "labels" / "label_distribution.csv"
+    dist_path = LABELS_DIR / "label_distribution.csv"
     if dist_path.exists():
         df_dist = pd.read_csv(dist_path)
         sections.append("## Phase 3 — Label Distribution\n")
         sections.append(df_dist.to_markdown(index=False))
         sections.append("\n")
-
-        dropped = df_dist[df_dist["dropped"] == True]["pass_name"].tolist()
-        if dropped:
-            sections.append(f"\n**Dropped passes** (positive rate outside [5%, 95%]): "
-                            f"{', '.join(dropped)}\n")
 
     gate3 = RESULTS_DIR / "phase3_gate.txt"
     if gate3.exists():
@@ -64,15 +59,22 @@ def generate():
     if summary_path.exists():
         df_summary = pd.read_csv(summary_path)
         sections.append("## Phase 4 — Model Performance\n")
-        sections.append("### Per-Pass Summary (Mean ± Std over folds)\n")
+        sections.append("### Per-Pass Summary (Mean ± 95% CI over programs)\n")
         sections.append(df_summary.to_markdown(index=False))
         sections.append("\n")
 
-    cross_path = RESULTS_DIR / "phase4_cross_suite.csv"
-    if cross_path.exists():
-        df_cross = pd.read_csv(cross_path)
-        sections.append("### Cross-Suite Evaluation\n")
-        sections.append(df_cross.to_markdown(index=False))
+    wilcoxon_path = RESULTS_DIR / "phase4_wilcoxon.csv"
+    if wilcoxon_path.exists():
+        df_wilcoxon = pd.read_csv(wilcoxon_path)
+        sections.append("### Wilcoxon Signed-Rank Test (Holm-corrected)\n")
+        sections.append(df_wilcoxon.to_markdown(index=False))
+        sections.append("\n")
+
+    thresh_path = RESULTS_DIR / "threshold_sensitivity.csv"
+    if thresh_path.exists():
+        df_thresh = pd.read_csv(thresh_path)
+        sections.append("### Threshold Sensitivity\n")
+        sections.append(df_thresh.to_markdown(index=False))
         sections.append("\n")
 
     gate4 = RESULTS_DIR / "phase4_gate.txt"
@@ -80,24 +82,31 @@ def generate():
         sections.append(f"\n```\n{gate4.read_text(encoding='utf-8')}\n```\n")
 
     # ---- Phase 5: SHAP results ----
+    dual_path = RESULTS_DIR / "shap_dual_method.csv"
+    if dual_path.exists():
+        df_dual = pd.read_csv(dual_path)
+        sections.append("## Phase 5 — Explainability (SHAP)\n")
+        sections.append("### Rigor & Stability\n")
+        sections.append(df_dual.to_markdown(index=False))
+        sections.append("\n")
+
     rankings_path = RESULTS_DIR / "shap_rankings.csv"
     if rankings_path.exists():
         df_rank = pd.read_csv(rankings_path)
-        sections.append("## Phase 5 — Explainability (SHAP)\n")
-        sections.append("### Top 10 Features per Pass\n")
+        sections.append("### Top 10 Features per Interpretable Pass\n")
 
-        for pass_name in df_rank["pass_name"].unique():
-            pass_top = df_rank[df_rank["pass_name"] == pass_name].head(10)
-            sections.append(f"\n#### {pass_name}\n")
+        for key, group in df_rank.groupby(["pass_name", "target"]):
+            pass_name, target = key
+            pass_top = group.head(10)
+            sections.append(f"\n#### {pass_name} (target: {target})\n")
             sections.append(pass_top[["rank", "feature", "mean_abs_shap"]].to_markdown(index=False))
             sections.append("\n")
 
             # Embed beeswarm plot if it exists
-            beeswarm = FIGURES_DIR / "shap" / f"shap_beeswarm_{pass_name}.png"
+            beeswarm = FIGURES_DIR / "shap" / f"shap_beeswarm_{pass_name}_{target}.png"
             if beeswarm.exists():
-                sections.append(f"\n![SHAP Beeswarm — {pass_name}]({beeswarm})\n")
+                sections.append(f"\n![SHAP Beeswarm — {pass_name} ({target})]({beeswarm})\n")
 
-    # Faithfulness
     faith_path = RESULTS_DIR / "faithfulness.csv"
     if faith_path.exists():
         df_faith = pd.read_csv(faith_path)
@@ -105,20 +114,88 @@ def generate():
         sections.append(df_faith.to_markdown(index=False))
         sections.append("\n")
 
-    # Heuristic agreement
+    interact_path = RESULTS_DIR / "interaction_top10.csv"
+    if interact_path.exists():
+        df_interact = pd.read_csv(interact_path)
+        sections.append("### Top 10 Feature Interactions\n")
+        sections.append(df_interact.to_markdown(index=False))
+        sections.append("\n")
+
+    size_path = RESULTS_DIR / "size_confound.csv"
+    if size_path.exists():
+        df_size = pd.read_csv(size_path)
+        sections.append("### Size Confound Analysis\n")
+        sections.append(df_size.to_markdown(index=False))
+        sections.append("\n")
+
     agree_path = RESULTS_DIR / "heuristic_agreement.csv"
     if agree_path.exists():
         df_agree = pd.read_csv(agree_path)
-        sections.append("### Heuristic Agreement\n")
+        sections.append("### Heuristic Agreement (Permutation Test)\n")
         sections.append(df_agree.to_markdown(index=False))
         sections.append("\n")
 
-    # Novel drivers
     novel_path = RESULTS_DIR / "novel_drivers.csv"
     if novel_path.exists():
         df_novel = pd.read_csv(novel_path)
         sections.append("### Candidate Novel Drivers\n")
         sections.append(df_novel.to_markdown(index=False))
+        sections.append("\n")
+
+    pooled_path = RESULTS_DIR / "pooled_heuristic_agreement.csv"
+    if pooled_path.exists():
+        df_pooled = pd.read_csv(pooled_path)
+        sections.append("### Pooled Heuristic Agreement Test\n")
+        sections.append(df_pooled.to_markdown(index=False))
+        sections.append("\n")
+
+    thresh_analysis = RESULTS_DIR / "threshold_analysis.csv"
+    if thresh_analysis.exists():
+        df_ta = pd.read_csv(thresh_analysis)
+        sections.append("### Threshold Analysis\n")
+        sections.append(df_ta.to_markdown(index=False))
+        sections.append("\n")
+        # Embed dependence plots
+        shap_dir = FIGURES_DIR / "shap"
+        if shap_dir.exists():
+            for row in df_ta.itertuples():
+                img = shap_dir / f"shap_dependence_{row.pass_name}_{row.target}_{row.feature}.png"
+                if img.exists():
+                    sections.append(f"\n![SHAP Dependence — {row.pass_name} ({row.target}) {row.feature}]({img})\n")
+
+    # ---- Phase 5 Gating Summary ----
+    if dist_path.exists() and dual_path.exists():
+        df_d = pd.read_csv(dist_path)
+        df_du = pd.read_csv(dual_path)
+        gate_rows = []
+        for _, r in df_d.iterrows():
+            p = r["pass_name"]
+            for t in ["beneficial", "harmful"]:
+                pos_rate = r.get(f"{t}_rate", 0)
+                if pos_rate < 0.05 or pos_rate > 0.95:
+                    status = "dropped"
+                    reason = "Pos rate out of bounds [5%, 95%]"
+                else:
+                    match = df_du[(df_du["pass_name"] == p) & (df_du["target"] == t)]
+                    if match.empty:
+                        status = "dropped"
+                        reason = "Failed model training / XGate"
+                    else:
+                        m = match.iloc[0]
+                        if m["interpretable"]:
+                            status = "interpreted"
+                            reason = "Stable & beats majority"
+                        else:
+                            status = "not interpreted"
+                            reasons = []
+                            if not m["stable"]: reasons.append("tau < 0.6")
+                            if not m["beats_majority"]: reasons.append("fails wilcoxon")
+                            reason = " and ".join(reasons)
+                gate_rows.append({"pass_name": p, "target": t, "status": status, "reason": reason})
+        
+        df_gate = pd.DataFrame(gate_rows)
+        sections.append("### Phase 5 Gating Summary\n")
+        sections.append(df_gate.to_markdown(index=False))
         sections.append("\n")
 
     gate5 = RESULTS_DIR / "phase5_gate.txt"

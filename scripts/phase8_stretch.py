@@ -53,8 +53,8 @@ def distill_to_decision_tree(df_merged, feature_cols, kept_passes):
     distill_results = []
     
     for pass_name in kept_passes:
-        # Load the original XGBoost model
-        model_path = models_dir / f"xgb_{pass_name}.pkl"
+        # Load the original XGBoost model (beneficial target)
+        model_path = models_dir / f"xgb_{pass_name}_beneficial.pkl"
         if not model_path.exists():
             continue
             
@@ -136,13 +136,19 @@ def compile_and_measure_runtime(c_file: Path, tools: dict, includes: list,
     
     # Base includes and math library
     compile_cmd = [tools["clang"], "-O0"]
+    polybench_c = None
     for inc in includes:
         compile_cmd.extend(["-I", str(inc)])
+        if (inc / "polybench.c").exists():
+            polybench_c = inc / "polybench.c"
+
+    # Add POLYBENCH_TIME macro
+    compile_cmd.append("-DPOLYBENCH_TIME")
     
     if pass_sequence:
         # Step 1: Compile to IR
         ir_path = c_file.with_suffix('.ll')
-        cmd1 = [tools["clang"], "-O0", "-Xclang", "-disable-O0-optnone", "-emit-llvm", "-S"]
+        cmd1 = [tools["clang"], "-O0", "-Xclang", "-disable-O0-optnone", "-emit-llvm", "-S", "-DPOLYBENCH_TIME"]
         for inc in includes:
             cmd1.extend(["-I", str(inc)])
         cmd1.extend(["-o", str(ir_path), str(c_file)])
@@ -154,7 +160,13 @@ def compile_and_measure_runtime(c_file: Path, tools: dict, includes: list,
         run_tool(cmd2)
         
         # Step 3: Compile to executable
-        cmd3 = [tools["clang"], str(opt_ir_path), "-o", str(exe_path), "-lm"]
+        cmd3 = [tools["clang"], str(opt_ir_path)]
+        if polybench_c:
+            cmd3.append(str(polybench_c))
+        cmd3.extend(["-o", str(exe_path), "-lm"])
+        for inc in includes:
+            cmd3.extend(["-I", str(inc)])
+        cmd3.append("-DPOLYBENCH_TIME")
         run_tool(cmd3)
         
         # Cleanup intermediate
@@ -162,6 +174,8 @@ def compile_and_measure_runtime(c_file: Path, tools: dict, includes: list,
         except OSError: pass
     else:
         # Direct compilation (Baseline -O0)
+        if polybench_c:
+            compile_cmd.append(str(polybench_c))
         compile_cmd.extend(["-o", str(exe_path), str(c_file), "-lm"])
         run_tool(compile_cmd)
         
@@ -171,7 +185,11 @@ def compile_and_measure_runtime(c_file: Path, tools: dict, includes: list,
         t0 = time.perf_counter()
         # We run the executable. Note: PolyBench prints output to stderr if POLYBENCH_DUMP_ARRAYS is set,
         # but by default it just runs silently. We capture output to prevent terminal spam.
-        subprocess.run([str(exe_path)], capture_output=True, timeout=30, check=True)
+        # Convert Windows path to WSL path
+        wsl_exe = str(exe_path).replace('\\', '/')
+        import re
+        wsl_exe = re.sub(r'^([a-zA-Z]):/', lambda m: f"/mnt/{m.group(1).lower()}/", wsl_exe)
+        subprocess.run(["wsl", wsl_exe], capture_output=True, timeout=30, check=True)
         runtimes.append(time.perf_counter() - t0)
             
     # Cleanup executable
@@ -208,7 +226,7 @@ def run_polybench_runtime_study(tools: dict):
         
     # We will test: Baseline (-O0), -O2 (simulated), and a Custom Sequence
     # A standard custom sequence discovered by our pipeline (hypothetical example)
-    custom_seq = ["sroa", "instcombine", "simplifycfg", "loop-rotate", "licm", "indvars", "gvn", "dse"]
+    custom_seq = ["sroa", "instcombine", "simplifycfg", "loop-rotate", "loop-mssa(licm)", "indvars", "gvn", "dse"]
     
     results = []
     for c_file in c_files:

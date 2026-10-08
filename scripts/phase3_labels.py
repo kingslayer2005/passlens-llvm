@@ -71,37 +71,21 @@ DROP_POS_RATE_HIGH = 0.95     # drop passes with pos rate > 95%
 
 def apply_pass(ir_text: str, pass_name: str, tools: dict) -> Optional[str]:
     """
-    Apply a single optimization pass to IR text.
+    Apply a single optimization pass to IR text using stdin/stdout in memory.
     Returns the optimized IR text.
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ll", delete=False,
-                                      dir=str(CACHE_DIR)) as tmp:
-        tmp.write(ir_text)
-        tmp_path = tmp.name
-
+    cmd = [
+        tools["opt"],
+        f"-passes={pass_name}",
+        "-S"
+    ]
     try:
-        out_path = tmp_path + ".out.ll"
-        cmd = [
-            tools["opt"],
-            f"-passes={pass_name}",
-            "-S",
-            "-o", out_path,
-            tmp_path,
-        ]
-        run_tool(cmd, timeout=OPT_TIMEOUT, check=True)
-        output_ir = Path(out_path).read_text(encoding="utf-8", errors="replace")
-        return output_ir
-
-    finally:
-        # Clean up temp files immediately to save disk
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        try:
-            os.unlink(tmp_path + ".out.ll")
-        except OSError:
-            pass
+        result = run_tool(cmd, timeout=OPT_TIMEOUT, check=True, input_data=ir_text)
+        return result.stdout
+    except subprocess.CalledProcessError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def apply_pass_sequence(ir_text: str, passes: List[str], tools: dict) -> Optional[str]:
@@ -150,10 +134,10 @@ def generate_random_states(ir_text: str, func_name: str, seed: int,
 # Label generation for one function
 # ============================================================================
 
-def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -> List[dict]:
+def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -> Tuple[List[dict], List[dict]]:
     """
     Generate labels for one function across all states and passes.
-    Returns a list of label dicts.
+    Returns (labels_list, features_list).
     """
     ll_path = PROJECT_ROOT / func_info["path"]
     if not ll_path.exists():
@@ -174,11 +158,40 @@ def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -
     states.extend(generate_random_states(ir_text, func_name, seed, tools))
 
     labels = []
+    features_list = []
+
+    # Import locally to avoid circular dependency
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.phase2_features import extract_features_from_ir_text
+    from scripts.utils import normalize_ir, hash_ir
 
     for state_name, state_ir, prefix_passes in states:
         inst_before = count_instructions(state_ir)
         if inst_before < 1:
             continue
+
+        state_ir_h = hash_ir(state_ir)
+        
+        # Compute features for this state
+        try:
+            feats = extract_features_from_ir_text(state_ir, tools, func_name=func_name)
+            feats["suite"] = suite
+            feats["program"] = program
+            feats["function"] = func_name
+            feats["ir_hash"] = state_ir_h
+            features_list.append(feats)
+        except Exception as e:
+            log.warning("Failed to extract features for %s/%s state=%s: %s", program, func_name, state_name, e)
+            continue
+
+        # Get the normalized no-op ir for 'fired' comparison
+        noop_res = run_tool([tools["opt"], "-S"], input_data=state_ir, timeout=10, check=False)
+        if noop_res.returncode == 0:
+            noop_ir_norm = normalize_ir(noop_res.stdout)
+        else:
+            noop_ir_norm = ""
 
         for pass_name in active_passes:
             real_pass = PASS_WRAPPERS.get(pass_name, pass_name)
@@ -188,6 +201,7 @@ def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -
                 # opt failed — record as no change
                 inst_after = inst_before
                 outcome = "equal"
+                fired = False
             else:
                 inst_after = count_instructions(result_ir)
                 if inst_after < inst_before:
@@ -196,6 +210,9 @@ def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -
                     outcome = "increased"
                 else:
                     outcome = "equal"
+                    
+                result_ir_norm = normalize_ir(result_ir)
+                fired = (result_ir_norm != noop_ir_norm) if noop_ir_norm else False
 
             rel_reduction = (inst_before - inst_after) / inst_before
             beneficial = 1 if rel_reduction >= BENEFICIAL_THRESHOLD else 0
@@ -204,7 +221,7 @@ def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -
                 "suite": suite,
                 "program": program,
                 "function": func_name,
-                "ir_hash": ir_h,
+                "ir_hash": state_ir_h,
                 "state": state_name,
                 "prefix_passes": ";".join(prefix_passes),
                 "pass_name": pass_name,
@@ -212,10 +229,11 @@ def label_one_function(func_info: dict, tools: dict, active_passes: List[str]) -
                 "inst_after": inst_after,
                 "rel_reduction": round(rel_reduction, 6),
                 "outcome": outcome,
+                "fired": fired,
                 "beneficial": beneficial,
             })
 
-    return labels
+    return labels, features_list
 
 
 # ============================================================================
@@ -313,30 +331,92 @@ def run_phase3(smoke: bool = False, n_jobs: int = 1):
 
     # Generate labels (sequential for now — joblib parallelization below)
     import time
+    # Resumable from cache
+    processed_hashes = set()
+    from scripts.utils import DATA_DIR
+    features_path = DATA_DIR / "features" / "features.csv"
+    labels_path = LABELS_DIR / "labels.csv"
+    if labels_path.exists() and features_path.exists():
+        try:
+            df_old = pd.read_csv(labels_path)
+            processed_hashes = set(df_old["ir_hash"].unique())
+            log.info("Found %d already processed states in cache.", len(processed_hashes))
+        except Exception:
+            pass
+            
+    # We filter functions if ALL their possible states would be in the cache. 
+    # For a simple resumability, we just check if the baseline hash is in the cache.
+    # Actually, we can just process all and let label_one_function skip, or just skip if the function's baseline is in labels.csv.
+    # But since baseline hash is modified to state hash, we can check if the function's base IR hash is in labels.csv by matching function name, or just skip if function is in labels.csv.
+    if labels_path.exists():
+        try:
+            df_old = pd.read_csv(labels_path)
+            processed_funcs = set(df_old["function"].unique())
+            func_list = [f for f in func_list if f["function"] not in processed_funcs]
+            log.info("Resuming: %d functions already processed, %d remaining.", len(processed_funcs), len(func_list))
+        except Exception:
+            pass
+
     start_time = time.time()
     total_opt_calls = len(func_list) * (1 + NUM_RANDOM_STATES) * len(active_passes)
     all_labels = []
+    all_features = []
+    
+    # Load old data if resuming
+    if labels_path.exists() and features_path.exists():
+        try:
+            all_labels = pd.read_csv(labels_path).to_dict('records')
+            all_features = pd.read_csv(features_path).to_dict('records')
+        except Exception:
+            all_labels = []
+            all_features = []
 
-    if n_jobs == 1:
-        for i, func_info in enumerate(func_list):
-            labels = label_one_function(func_info, tools, active_passes)
-            all_labels.extend(labels)
-            if (i + 1) % 50 == 0:
-                log.info("  Processed %d / %d functions (%d labels so far)",
-                         i + 1, len(func_list), len(all_labels))
-    else:
-        from joblib import Parallel, delayed
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(label_one_function)(fi, tools, active_passes)
-            for fi in func_list
-        )
-        for r in results:
-            all_labels.extend(r)
+    if len(func_list) > 0:
+        if n_jobs == 1:
+            for i, func_info in enumerate(func_list):
+                labels, feats = label_one_function(func_info, tools, active_passes)
+                all_labels.extend(labels)
+                all_features.extend(feats)
+                if (i + 1) % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = (i + 1) / elapsed
+                    rem = (len(func_list) - (i + 1)) / rate
+                    progress_msg = f"Processed {i+1}/{len(func_list)} | Elapsed: {elapsed:.1f}s | ETA: {rem:.1f}s\n"
+                    with open(RESULTS_DIR / "phase3_progress.txt", "a") as f:
+                        f.write(progress_msg)
+        else:
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=n_jobs, return_as="generator")(
+                delayed(label_one_function)(fi, tools, active_passes)
+                for fi in func_list
+            )
+            for i, (r_labels, r_feats) in enumerate(results):
+                all_labels.extend(r_labels)
+                all_features.extend(r_feats)
+                if (i + 1) % 10 == 0 or (i + 1) == len(func_list):
+                    elapsed = time.time() - start_time
+                    rate = (i + 1) / elapsed
+                    rem = (len(func_list) - (i + 1)) / rate
+                    progress_msg = f"Processed {i+1}/{len(func_list)} | Elapsed: {elapsed:.1f}s | ETA: {rem:.1f}s\n"
+                    with open(RESULTS_DIR / "phase3_progress.txt", "a") as f:
+                        f.write(progress_msg)
+                    
+                    # Periodically save to allow resuming if killed
+                    pd.DataFrame(all_labels).to_csv(labels_path, index=False)
+                    pd.DataFrame(all_features).drop_duplicates(subset=["ir_hash"]).to_csv(features_path, index=False)
 
     elapsed = time.time() - start_time
     if elapsed > 0:
         calls_sec = total_opt_calls / elapsed
         log.info("Total labels generated: %d in %.1fs (%.1f calls/sec)", len(all_labels), elapsed, calls_sec)
+
+    # Save features CSV
+    from scripts.utils import DATA_DIR
+    features_path = DATA_DIR / "features" / "features.csv"
+    if all_features:
+        df_features = pd.DataFrame(all_features).drop_duplicates(subset=["ir_hash"])
+        df_features.to_csv(features_path, index=False)
+        log.info("Saved features to %s (%d rows)", features_path, len(df_features))
 
     # Save labels CSV
     labels_path = LABELS_DIR / "labels.csv"
@@ -347,19 +427,51 @@ def run_phase3(smoke: bool = False, n_jobs: int = 1):
 
         # ---- Label distribution table ----
         dist_rows = []
+        target_status = {}
         for pass_name in active_passes:
             pass_df = df_labels[df_labels["pass_name"] == pass_name]
             n_total = len(pass_df)
-            n_pos = pass_df["beneficial"].sum()
-            pos_rate = n_pos / n_total if n_total > 0 else 0.0
+            if n_total == 0:
+                continue
+
+            # Outcomes
+            n_dec = (pass_df["outcome"] == "decreased").sum()
+            n_eq = (pass_df["outcome"] == "equal").sum()
+            n_inc = (pass_df["outcome"] == "increased").sum()
+            n_fired = pass_df["fired"].sum()
+
+            # Targets
+            n_ben = pass_df["beneficial"].sum()
+            n_harm = n_inc
+
+            pos_rate_ben = n_ben / n_total
+            pos_rate_harm = n_harm / n_total
+
+            drop_ben = pos_rate_ben < DROP_POS_RATE_LOW or pos_rate_ben > DROP_POS_RATE_HIGH
+            drop_harm = pos_rate_harm < DROP_POS_RATE_LOW or pos_rate_harm > DROP_POS_RATE_HIGH
+
             dist_rows.append({
                 "pass_name": pass_name,
                 "total_samples": n_total,
-                "beneficial": int(n_pos),
-                "not_beneficial": n_total - int(n_pos),
-                "positive_rate": round(pos_rate, 4),
-                "dropped": pos_rate < DROP_POS_RATE_LOW or pos_rate > DROP_POS_RATE_HIGH,
+                "fired": int(n_fired),
+                "decreased": int(n_dec),
+                "equal": int(n_eq),
+                "increased": int(n_inc),
+                "beneficial_rate": round(pos_rate_ben, 4),
+                "harmful_rate": round(pos_rate_harm, 4),
+                "drop_beneficial": drop_ben,
+                "drop_harmful": drop_harm,
             })
+
+            if not drop_ben:
+                target_status[f"{pass_name}_beneficial"] = "kept"
+            else:
+                target_status[f"{pass_name}_beneficial"] = "dropped"
+
+            if not drop_harm:
+                target_status[f"{pass_name}_harmful"] = "kept"
+            else:
+                target_status[f"{pass_name}_harmful"] = "dropped"
 
         df_dist = pd.DataFrame(dist_rows)
         dist_path = LABELS_DIR / "label_distribution.csv"
@@ -369,24 +481,25 @@ def run_phase3(smoke: bool = False, n_jobs: int = 1):
         # Print distribution
         log.info("\n--- Label Distribution ---")
         for _, row in df_dist.iterrows():
-            status = "DROPPED" if row["dropped"] else "OK"
-            log.info("  %-25s pos_rate=%.2f%% (%d/%d) [%s]",
-                     row["pass_name"],
-                     row["positive_rate"] * 100,
-                     row["beneficial"],
-                     row["total_samples"],
-                     status)
+            stat_ben = "DROPPED" if row["drop_beneficial"] else "KEPT"
+            stat_harm = "DROPPED" if row["drop_harmful"] else "KEPT"
+            log.info("  %-25s fired=%-4d dec=%-4d eq=%-4d inc=%-4d | ben_rate=%5.1f%% [%-7s] harm_rate=%5.1f%% [%-7s]",
+                     row["pass_name"], row["fired"], row["decreased"], row["equal"], row["increased"],
+                     row["beneficial_rate"] * 100, stat_ben,
+                     row["harmful_rate"] * 100, stat_harm)
 
-        # List dropped passes
-        dropped = df_dist[df_dist["dropped"] == True]["pass_name"].tolist()
-        if dropped:
-            log.info("Dropped passes (pos rate outside [5%%, 95%%]): %s", dropped)
+        # List dropped passes (if a pass has BOTH targets dropped, it's totally dropped)
+        dropped_passes = df_dist[(df_dist["drop_beneficial"] == True) & (df_dist["drop_harmful"] == True)]["pass_name"].tolist()
+        kept_passes = df_dist[(df_dist["drop_beneficial"] == False) | (df_dist["drop_harmful"] == False)]["pass_name"].tolist()
+
+        # Save target status for Phase 4
+        with open(LABELS_DIR / "target_status.json", "w") as f:
+            json.dump(target_status, f, indent=2)
 
         # ---- Determinism check ----
         check_determinism(all_labels, tools, n_check=min(50, len(all_labels)))
 
         # ---- Gate report ----
-        kept_passes = df_dist[df_dist["dropped"] == False]["pass_name"].tolist()
         report = f"""
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 3 GATE REPORT                     ║
@@ -395,9 +508,9 @@ def run_phase3(smoke: bool = False, n_jobs: int = 1):
 ║ Functions:              {len(func_list):>8}                     ║
 ║ Passes (active):        {len(active_passes):>8}                     ║
 ║ Passes (kept):          {len(kept_passes):>8}                     ║
-║ Passes (dropped):       {len(dropped):>8}                     ║
+║ Passes (dropped):       {len(dropped_passes):>8}                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Dropped passes: {', '.join(dropped) if dropped else 'none':<37}║
+║ Dropped passes: {', '.join(dropped_passes) if dropped_passes else 'none':<37}║
 ╚══════════════════════════════════════════════════════╝
 """
         log.info(report)

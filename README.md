@@ -1,5 +1,5 @@
+# PRELIMINARY: smoke run on 52 programs, not a research result
 # Interpretable Compiler Pass Selection: Explaining ML-Guided Optimization Decisions using SHAP on LLVM IR Features
-
 **Authors:** Aarush Gupta (23BDS0219) + [teammates TBD]
 
 This repository contains the complete, reproducible research codebase for studying how machine learning models make compiler optimization decisions. We use XGBoost and TreeSHAP to interpret the feature importance and feature interactions that drive optimization predictions on LLVM IR.

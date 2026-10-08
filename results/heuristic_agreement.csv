@@ -1,5 +1,6 @@
-pass_name,hit_at_5,mrr,direction_agreement,random_hit_at_5,random_mrr,n_heuristic_features
-simplifycfg,0.0,0.0338,0.3333,0.0615,0.0303,4
-early-cse,0.3333,0.1389,0.0,0.0462,0.0303,3
-jump-threading,0.0,0.0352,0.5,0.0462,0.0303,3
-indvars,0.0,0.0609,0.0,0.0462,0.0303,3
+pass_name,target,heuristic_type,hit_at_5,hit_at_5_ci_lo,hit_at_5_ci_hi,hit_at_5_p,mrr,mrr_ci_lo,mrr_ci_hi,mrr_p,cross_pass_mean_hit5,cross_pass_mean_mrr,beats_others,n_heuristic_features,hit_at_5_p_holm,mrr_p_holm
+simplifycfg,beneficial,applicability,0.0,0.0,0.0,1.0,0.0614,0.0204,0.1111,0.3188,0.0588,0.0799,False,3,1.0,0.9563999999999999
+early-cse,beneficial,applicability,0.0,0.0,0.0,1.0,0.0714,0.0714,0.0714,0.2079,0.1765,0.1106,False,1,1.0,0.8550000000000001
+early-cse,beneficial,cost_model,0.0,0.0,0.0,1.0,0.0159,0.0159,0.0159,0.9264,0.0,0.03,False,1,1.0,1.0
+jump-threading,beneficial,applicability,0.0,0.0,0.0,1.0,0.0833,0.0833,0.0833,0.171,0.0588,0.063,True,1,1.0,0.8550000000000001
+jump-threading,beneficial,cost_model,0.0,0.0,0.0,1.0,0.0159,0.0159,0.0159,0.9264,0.0,0.0289,False,1,1.0,1.0

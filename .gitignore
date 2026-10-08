@@ -16,4 +16,9 @@ data/cache/
 Thumbs.db
 
 # Pipeline logs
-pipeline_*.log
+pipeline*.log
+
+# Temp files
+out.ll
+*.tmp
+tmp/

@@ -2,10 +2,9 @@
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 4 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Passes evaluated:              6                     ║
-║ Passes where XGB > Maj:        5                     ║
-║ Flagged passes:                1                     ║
-╠══════════════════════════════════════════════════════╣
-║ Flagged: gvn                                         ║
-║ (excluded from Phase 5 interpretation)               ║
+║ Passes evaluated:              7                     ║
+║ Targets per pass:              2                     ║
+║ Repeats x folds:        3x5 =   15                    ║
+║ XGB beats majority:            5                     ║
+║ Flagged passes:                2                     ║
 ╚══════════════════════════════════════════════════════╝

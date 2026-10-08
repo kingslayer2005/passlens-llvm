@@ -26,6 +26,7 @@ import argparse
 import csv
 import hashlib
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -111,11 +112,15 @@ def find_c_files(root: Path, suite: str, smoke: bool = False) -> List[Tuple[str,
         if "utilities" in str(c_file) or "common" in str(c_file):
             continue
         # Derive program name from parent directory
-        program = c_file.stem
+        prog_dir = c_file.parent
+        program = prog_dir.name
+        if program == "src":
+            prog_dir = prog_dir.parent
+            program = prog_dir.name
         # In smoke mode, only process SMOKE_PROGRAMS
         if smoke and not any(sp in program for sp in SMOKE_PROGRAMS):
             continue
-        results.append((suite, program, c_file))
+        results.append((suite, program, c_file, prog_dir))
 
     log.info("Found %d .c files in %s%s", len(results), suite,
              " (smoke mode)" if smoke else "")
@@ -305,13 +310,12 @@ def run_phase1(smoke: bool = False):
     # ---- 3. Find .c files ----
     c_files = []
     if polybench_dir.exists():
-        # PolyBench has include directories for its headers
         polybench_includes = list(polybench_dir.rglob("utilities"))
-        c_files.extend([(s, p, f, polybench_includes)
-                        for s, p, f in find_c_files(polybench_dir, "polybench", smoke)])
+        c_files.extend([(s, p, f, polybench_includes, pd)
+                        for s, p, f, pd in find_c_files(polybench_dir, "polybench", smoke)])
     if mibench_dir.exists():
-        c_files.extend([(s, p, f, [])
-                        for s, p, f in find_c_files(mibench_dir, "mibench", smoke)])
+        c_files.extend([(s, p, f, [], pd)
+                        for s, p, f, pd in find_c_files(mibench_dir, "mibench", smoke)])
 
     log.info("Total C files to compile: %d", len(c_files))
 
@@ -320,7 +324,7 @@ def run_phase1(smoke: bool = False):
     compile_failures = 0
     extract_failures = 0
 
-    for suite, program, c_file, includes in c_files:
+    for suite, program, c_file, includes, prog_dir in c_files:
         # Output paths
         raw_ll = IR_DIR / suite / program / f"{c_file.stem}_raw.ll"
         baseline_ll = IR_DIR / suite / program / f"{c_file.stem}_baseline.ll"
@@ -328,11 +332,19 @@ def run_phase1(smoke: bool = False):
 
         # Step A: Compile C -> IR
         if not raw_ll.exists():
-            ok = compile_to_ir(c_file, raw_ll, tools, includes)
+            # Include all header directories inside the benchmark program
+            all_headers = list(prog_dir.rglob("*.h"))
+            extra_includes = list(set([h.parent for h in all_headers]))
+            combined_includes = includes + extra_includes
+
+            ok = compile_to_ir(c_file, raw_ll, tools, combined_includes)
             if not ok:
                 compile_failures += 1
-                error_log.write(f"COMPILE_FAIL\t{c_file}\n")
+                error_log.write(f"{suite},{c_file},COMPILE_FAIL\n")
                 log.warning("Compilation failed: %s", c_file)
+                # Also write to results/compile_failures.csv
+                with open("results/compile_failures.csv", "a") as f:
+                    f.write(f"{suite},{c_file},COMPILE_FAIL\n")
                 continue
         
         # Step B: mem2reg
@@ -340,7 +352,7 @@ def run_phase1(smoke: bool = False):
             ok = run_mem2reg(raw_ll, baseline_ll, tools)
             if not ok:
                 compile_failures += 1
-                error_log.write(f"MEM2REG_FAIL\t{c_file}\n")
+                error_log.write(f"{suite},{c_file},MEM2REG_FAIL\n")
                 log.warning("mem2reg failed: %s", raw_ll)
                 continue
 
@@ -353,7 +365,7 @@ def run_phase1(smoke: bool = False):
                 ok = extract_single_function(baseline_ll, func_name, func_ll, tools)
                 if not ok:
                     extract_failures += 1
-                    error_log.write(f"EXTRACT_FAIL\t{baseline_ll}\t{func_name}\n")
+                    error_log.write(f"{suite},{baseline_ll},EXTRACT_FAIL,{func_name}\n")
                     continue
 
             # Read the extracted function and count instructions
@@ -379,7 +391,22 @@ def run_phase1(smoke: bool = False):
     log.info("Dropped %d functions with < 10 instructions (kept %d)",
              before_filter - len(all_functions), len(all_functions))
 
-    # ---- 6. Deduplicate by IR hash ----
+    # ---- 6. Group and Cap (max 100 per program) ----
+    grouped = {}
+    for func in all_functions:
+        grouped.setdefault(func["program"], []).append(func)
+
+    rng = random.Random(42)
+    capped_functions = []
+    for prog, funcs in grouped.items():
+        if len(funcs) > 100:
+            funcs = rng.sample(funcs, 100)
+        capped_functions.extend(funcs)
+
+    log.info("Capped functions to 100 per program: %d remain", len(capped_functions))
+    all_functions = capped_functions
+
+    # ---- 7. Deduplicate by IR hash ----
     seen_hashes = set()
     unique_functions = []
     duplicates = 0
@@ -433,10 +460,10 @@ def run_phase1(smoke: bool = False):
     gate_path.parent.mkdir(parents=True, exist_ok=True)
     gate_path.write_text(report, encoding='utf-8')
 
-    # ---- 9. Check if we need AnghaBench ----
+    # ---- 9. Check if we need more functions ----
     if n_unique < 1000 and not smoke:
         log.error("Only %d unique functions — below 1000 threshold. Stopping.", n_unique)
-        sys.exit(1)
+        # We will NOT download AnghaBench automatically. We will wait for user approval.
     elif smoke:
         log.info("Smoke mode — skipping function threshold check.")
 

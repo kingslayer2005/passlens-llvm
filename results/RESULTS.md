@@ -1,4 +1,4 @@
-# Results
+# PRELIMINARY: smoke run on 52 programs, not a research result
 
 > **Auto-generated** — all numbers come from CSV files in `results/`.
 > Do not edit manually; re-run `python -m scripts.generate_results_md` instead.
@@ -12,11 +12,11 @@
 ╔══════════════════════════════════════════════════╗
 ║            PHASE 1 GATE REPORT                   ║
 ╠══════════════════════════════════════════════════╣
-║ Programs processed:          3                   ║
-║ Total functions (≥10i):     12                   ║
-║ Unique functions:           12                   ║
-║ Duplicates removed:          0                   ║
-║ Compilation failures:        0                   ║
+║ Programs processed:         52                   ║
+║ Total functions (≥10i):    854                   ║
+║ Unique functions:          819                   ║
+║ Duplicates removed:         35                   ║
+║ Compilation failures:      742                   ║
 ║ Extraction failures:         0                   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -24,30 +24,27 @@
 
 ## Phase 3 — Label Distribution
 
-| pass_name              |   total_samples |   beneficial |   not_beneficial |   positive_rate | dropped   |
-|:-----------------------|----------------:|-------------:|-----------------:|----------------:|:----------|
-| sroa                   |              40 |            0 |               40 |           0     | True      |
-| instcombine            |              40 |           35 |                5 |           0.875 | False     |
-| simplifycfg            |              40 |           26 |               14 |           0.65  | False     |
-| early-cse              |              40 |           23 |               17 |           0.575 | False     |
-| gvn                    |              40 |           36 |                4 |           0.9   | False     |
-| sccp                   |              40 |            0 |               40 |           0     | True      |
-| adce                   |              40 |            0 |               40 |           0     | True      |
-| dse                    |              40 |            0 |               40 |           0     | True      |
-| reassociate            |              40 |            0 |               40 |           0     | True      |
-| jump-threading         |              40 |           24 |               16 |           0.6   | False     |
-| correlated-propagation |              40 |            0 |               40 |           0     | True      |
-| licm                   |              40 |            0 |               40 |           0     | True      |
-| loop-rotate            |              40 |            0 |               40 |           0     | True      |
-| indvars                |              40 |            8 |               32 |           0.2   | False     |
-| loop-deletion          |              40 |            0 |               40 |           0     | True      |
-| loop-idiom             |              40 |            0 |               40 |           0     | True      |
-| loop-unroll            |              40 |            0 |               40 |           0     | True      |
-| tailcallelim           |              40 |            0 |               40 |           0     | True      |
+| pass_name              |   total_samples |   decreased |   equal |   increased |   beneficial_rate |   harmful_rate | drop_beneficial   | drop_harmful   |
+|:-----------------------|----------------:|------------:|--------:|------------:|------------------:|---------------:|:------------------|:---------------|
+| sroa                   |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| instcombine            |              40 |          35 |       5 |           0 |             0.875 |          0     | False             | True           |
+| simplifycfg            |              40 |          26 |      14 |           0 |             0.65  |          0     | False             | True           |
+| early-cse              |              40 |          26 |      14 |           0 |             0.575 |          0     | False             | True           |
+| gvn                    |              40 |          36 |       4 |           0 |             0.9   |          0     | False             | True           |
+| sccp                   |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| adce                   |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| dse                    |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| reassociate            |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| jump-threading         |              40 |          24 |      16 |           0 |             0.6   |          0     | False             | True           |
+| correlated-propagation |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| licm                   |              40 |           0 |      39 |           1 |             0     |          0.025 | True              | True           |
+| loop-rotate            |              40 |           0 |      13 |          27 |             0     |          0.675 | True              | False          |
+| indvars                |              40 |           8 |      15 |          17 |             0.2   |          0.425 | False             | False          |
+| loop-deletion          |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
+| loop-idiom             |              40 |           0 |      39 |           1 |             0     |          0.025 | True              | True           |
+| loop-unroll            |              40 |           0 |      39 |           1 |             0     |          0.025 | True              | True           |
+| tailcallelim           |              40 |           0 |      40 |           0 |             0     |          0     | True              | True           |
 
-
-
-**Dropped passes** (positive rate outside [5%, 95%]): sroa, sccp, adce, dse, reassociate, correlated-propagation, licm, loop-rotate, loop-deletion, loop-idiom, loop-unroll, tailcallelim
 
 
 ```
@@ -58,40 +55,102 @@
 ║ Total samples:               720                     ║
 ║ Functions:                    10                     ║
 ║ Passes (active):              18                     ║
-║ Passes (kept):                 6                     ║
-║ Passes (dropped):             12                     ║
+║ Passes (kept):                 7                     ║
+║ Passes (dropped):             11                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Dropped passes: sroa, sccp, adce, dse, reassociate, correlated-propagation, licm, loop-rotate, loop-deletion, loop-idiom, loop-unroll, tailcallelim║
+║ Dropped passes: sroa, sccp, adce, dse, reassociate, correlated-propagation, licm, loop-deletion, loop-idiom, loop-unroll, tailcallelim║
 ╚══════════════════════════════════════════════════════╝
 
 ```
 
 ## Phase 4 — Model Performance
 
-### Per-Pass Summary (Mean ± Std over folds)
+### Per-Pass Summary (Mean ± 95% CI over programs)
 
-| pass_name      | model               |   pr_auc_mean |   pr_auc_std |   f1_mean |   f1_std |   mcc_mean |   mcc_std |
-|:---------------|:--------------------|--------------:|-------------:|----------:|---------:|-----------:|----------:|
-| simplifycfg    | majority            |        0.6042 |       0.2009 |    0.7391 |   0.169  |     0      |    0      |
-| simplifycfg    | logistic_regression |        0.8952 |       0.1298 |    0.9379 |   0.0732 |     0.877  |    0.1141 |
-| simplifycfg    | random_forest       |        0.9091 |       0.1383 |    0.9379 |   0.0732 |     0.877  |    0.1141 |
-| simplifycfg    | xgboost             |        0.8674 |       0.1257 |    0.7968 |   0.2391 |     0.7213 |    0.3089 |
-| early-cse      | majority            |        0.625  |       0.2165 |    0.4445 |   0.3849 |     0      |    0      |
-| early-cse      | logistic_regression |        0.7773 |       0.1828 |    0.7758 |   0.042  |     0.5109 |    0.1151 |
-| early-cse      | random_forest       |        0.9457 |       0.0547 |    0.8008 |   0.0739 |     0.5685 |    0.1862 |
-| early-cse      | xgboost             |        0.9457 |       0.0547 |    0.8008 |   0.0739 |     0.5685 |    0.1862 |
-| gvn            | majority            |        0.875  |       0      |    0.9333 |   0      |     0      |    0      |
-| gvn            | logistic_regression |        0.8631 |       0.0042 |    0.9333 |   0      |     0      |    0      |
-| gvn            | random_forest       |        0.8914 |       0.0442 |    0.9333 |   0      |     0      |    0      |
-| gvn            | xgboost             |        0.875  |       0      |    0.9333 |   0      |     0      |    0      |
-| jump-threading | majority            |        0.5625 |       0.1654 |    0.7098 |   0.1441 |     0      |    0      |
-| jump-threading | logistic_regression |        0.8369 |       0.0934 |    0.9076 |   0.0497 |     0.7921 |    0.0575 |
-| jump-threading | random_forest       |        0.8799 |       0.1171 |    0.8694 |   0.0352 |     0.7314 |    0.0516 |
-| jump-threading | xgboost             |        0.8369 |       0.0934 |    0.7665 |   0.2036 |     0.6364 |    0.2146 |
-| indvars        | majority            |        0.25   |       0      |    0      |   0      |     0      |    0      |
-| indvars        | logistic_regression |        0.75   |       0.3536 |    0.8334 |   0.2357 |     0.7887 |    0.2988 |
-| indvars        | random_forest       |        1      |       0      |    0.3334 |   0.4714 |     0.2887 |    0.4083 |
-| indvars        | xgboost             |        1      |       0      |    0.5    |   0.7071 |     0.5    |    0.7071 |
+| pass_name      | target     | model               |   pr_auc_mean |   pr_auc_std |   pr_auc_ci_lo |   pr_auc_ci_hi |   f1_mean |   mcc_mean |
+|:---------------|:-----------|:--------------------|--------------:|-------------:|---------------:|---------------:|----------:|-----------:|
+| simplifycfg    | beneficial | majority            |        0.6042 |       0.164  |         0.375  |         0.75   |    0.7391 |     0      |
+| simplifycfg    | beneficial | logistic_regression |        0.8687 |       0.1025 |         0.75   |         1      |    0.8646 |     0.7264 |
+| simplifycfg    | beneficial | random_forest       |        0.8952 |       0.106  |         0.75   |         1      |    0.9379 |     0.877  |
+| simplifycfg    | beneficial | xgboost             |        0.9091 |       0.1129 |         0.75   |         1      |    0.8654 |     0.7846 |
+| early-cse      | beneficial | majority            |        0.625  |       0.1768 |         0.5    |         0.875  |    0.4445 |     0      |
+| early-cse      | beneficial | logistic_regression |        0.9162 |       0.0836 |         0.8021 |         1      |    0.7758 |     0.5109 |
+| early-cse      | beneficial | random_forest       |        0.9457 |       0.0447 |         0.8906 |         1      |    0.8674 |     0.7093 |
+| early-cse      | beneficial | xgboost             |        0.9457 |       0.0447 |         0.8906 |         1      |    0.798  |     0.4593 |
+| gvn            | beneficial | majority            |        0.875  |       0      |         0.875  |         0.875  |    0.9333 |     0      |
+| gvn            | beneficial | logistic_regression |        0.8913 |       0.0312 |         0.8601 |         0.9226 |    0.9333 |     0      |
+| gvn            | beneficial | random_forest       |        0.9122 |       0.0104 |         0.9018 |         0.9226 |    0.9333 |     0      |
+| gvn            | beneficial | xgboost             |        0.875  |       0      |         0.875  |         0.875  |    0.7778 |     0      |
+| jump-threading | beneficial | majority            |        0.5625 |       0.135  |         0.375  |         0.6875 |    0.7098 |     0      |
+| jump-threading | beneficial | logistic_regression |        0.8799 |       0.0956 |         0.75   |         0.9773 |    0.8694 |     0.7314 |
+| jump-threading | beneficial | random_forest       |        0.8799 |       0.0956 |         0.75   |         0.9773 |    0.9076 |     0.7921 |
+| jump-threading | beneficial | xgboost             |        0.8508 |       0.0946 |         0.75   |         0.9773 |    0.7665 |     0.6364 |
+| loop-rotate    | harmful    | majority            |        0.6458 |       0.1062 |         0.5    |         0.75   |    0.7795 |     0      |
+| loop-rotate    | harmful    | logistic_regression |        0.9924 |       0.0107 |         0.9773 |         1      |    0.9855 |     0.9521 |
+| loop-rotate    | harmful    | random_forest       |        0.9785 |       0.0304 |         0.9356 |         1      |    0.9855 |     0.9521 |
+| loop-rotate    | harmful    | xgboost             |        0.9785 |       0.0304 |         0.9356 |         1      |    0.9123 |     0.8015 |
+| indvars        | beneficial | majority            |        0.25   |       0      |         0.25   |         0.25   |    0      |     0      |
+| indvars        | beneficial | logistic_regression |        1      |       0      |         1      |         1      |    0.25   |     0.1666 |
+| indvars        | beneficial | random_forest       |        1      |       0      |         1      |         1      |    0.5    |     0.5    |
+| indvars        | beneficial | xgboost             |        0.75   |       0.25   |         0.5    |         1      |    0.8333 |     0.7887 |
+| indvars        | harmful    | majority            |        0.4167 |       0.0589 |         0.375  |         0.5    |    0      |     0      |
+| indvars        | harmful    | logistic_regression |        0.6944 |       0.0786 |         0.5833 |         0.75   |    0.5524 |     0.4507 |
+| indvars        | harmful    | random_forest       |        0.8333 |       0.1179 |         0.75   |         1      |    0.9047 |     0.8497 |
+| indvars        | harmful    | xgboost             |        0.8333 |       0.1179 |         0.75   |         1      |    0.819  |     0.7406 |
+
+
+### Wilcoxon Signed-Rank Test (Holm-corrected)
+
+| pass_name      | target     | baseline            |   xgb_mean |   bl_mean |    p_value |   statistic |   p_holm | significant   |
+|:---------------|:-----------|:--------------------|-----------:|----------:|-----------:|------------:|---------:|:--------------|
+| simplifycfg    | beneficial | majority            |     0.9091 |    0.6042 | 0.00195312 |          45 | 0.041016 | True          |
+| early-cse      | beneficial | majority            |     0.9457 |    0.625  | 0.00195312 |          45 | 0.041016 | True          |
+| gvn            | beneficial | majority            |     0.875  |    0.875  | 1          |           0 | 1        | False         |
+| jump-threading | beneficial | majority            |     0.8508 |    0.5625 | 0.00195312 |          45 | 0.041016 | True          |
+| loop-rotate    | harmful    | majority            |     0.9785 |    0.6458 | 0.00195312 |          45 | 0.041016 | True          |
+| indvars        | harmful    | majority            |     0.8333 |    0.4167 | 0.00195312 |          45 | 0.041016 | True          |
+| indvars        | beneficial | majority            |     0.75   |    0.25   | 0.015625   |          21 | 0.25     | False         |
+| simplifycfg    | beneficial | logistic_regression |     0.9091 |    0.8687 | 0.125      |           6 | 1        | False         |
+| early-cse      | beneficial | logistic_regression |     0.9457 |    0.9162 | 0.125      |           6 | 1        | False         |
+| gvn            | beneficial | logistic_regression |     0.875  |    0.8914 | 0.84375    |           6 | 1        | False         |
+| jump-threading | beneficial | logistic_regression |     0.8508 |    0.8799 | 1          |           0 | 1        | False         |
+| loop-rotate    | harmful    | logistic_regression |     0.9785 |    0.9924 | 1          |           0 | 1        | False         |
+| indvars        | harmful    | logistic_regression |     0.8333 |    0.6944 | 0.125      |           6 | 1        | False         |
+| indvars        | beneficial | logistic_regression |     0.75   |    1      | 1          |           0 | 1        | False         |
+| simplifycfg    | beneficial | random_forest       |     0.9091 |    0.8952 | 0.125      |           6 | 1        | False         |
+| early-cse      | beneficial | random_forest       |     0.9457 |    0.9457 | 1          |           0 | 1        | False         |
+| gvn            | beneficial | random_forest       |     0.875  |    0.9122 | 1          |           0 | 1        | False         |
+| jump-threading | beneficial | random_forest       |     0.8508 |    0.8799 | 1          |           0 | 1        | False         |
+| loop-rotate    | harmful    | random_forest       |     0.9785 |    0.9785 | 1          |           0 | 1        | False         |
+| indvars        | harmful    | random_forest       |     0.8333 |    0.8333 | 1          |           0 | 1        | False         |
+| indvars        | beneficial | random_forest       |     0.75   |    1      | 1          |           0 | 1        | False         |
+
+
+### Threshold Sensitivity
+
+| pass_name      |   threshold |   pos_rate |   n_samples | top5_shap                                                                             |
+|:---------------|------------:|-----------:|------------:|:--------------------------------------------------------------------------------------|
+| instcombine    |       0.005 |      0.875 |          40 | log_inst_count; load_density; gep_density; const_operands_density; icmp_density       |
+| simplifycfg    |       0.005 |      0.65  |          40 | log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density       |
+| early-cse      |       0.005 |      0.65  |          40 | gep_density; icmp_density; const_operands_density; int_arith_density; log_inst_count  |
+| gvn            |       0.005 |      0.9   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
+| jump-threading |       0.005 |      0.6   |          40 | log_inst_count; icmp_density; cast_density; load_density; const_operands_density      |
+| loop-rotate    |       0.005 |      0     |          40 | nan                                                                                   |
+| indvars        |       0.005 |      0.2   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
+| instcombine    |       0.01  |      0.875 |          40 | log_inst_count; load_density; gep_density; const_operands_density; icmp_density       |
+| simplifycfg    |       0.01  |      0.65  |          40 | log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density       |
+| early-cse      |       0.01  |      0.575 |          40 | int_arith_density; const_operands_density; icmp_density; cast_density; log_inst_count |
+| gvn            |       0.01  |      0.9   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
+| jump-threading |       0.01  |      0.6   |          40 | log_inst_count; icmp_density; cast_density; load_density; const_operands_density      |
+| loop-rotate    |       0.01  |      0     |          40 | nan                                                                                   |
+| indvars        |       0.01  |      0.2   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
+| instcombine    |       0.02  |      0.675 |          40 | int_arith_density; icmp_density; log_inst_count; fp_arith_density; fcmp_density       |
+| simplifycfg    |       0.02  |      0.65  |          40 | log_inst_count; icmp_density; int_arith_density; fp_arith_density; fcmp_density       |
+| early-cse      |       0.02  |      0.55  |          40 | int_arith_density; icmp_density; load_density; log_inst_count; const_operands_density |
+| gvn            |       0.02  |      0.9   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
+| jump-threading |       0.02  |      0.6   |          40 | log_inst_count; icmp_density; cast_density; load_density; const_operands_density      |
+| loop-rotate    |       0.02  |      0     |          40 | nan                                                                                   |
+| indvars        |       0.02  |      0.2   |          40 | log_inst_count; int_arith_density; fp_arith_density; icmp_density; fcmp_density       |
 
 
 
@@ -100,162 +159,264 @@
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 4 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Passes evaluated:              6                     ║
-║ Passes where XGB > Maj:        5                     ║
-║ Flagged passes:                1                     ║
-╠══════════════════════════════════════════════════════╣
-║ Flagged: gvn                                         ║
-║ (excluded from Phase 5 interpretation)               ║
+║ Passes evaluated:              7                     ║
+║ Targets per pass:              2                     ║
+║ Repeats x folds:        3x5 =   15                    ║
+║ XGB beats majority:            5                     ║
+║ Flagged passes:                2                     ║
 ╚══════════════════════════════════════════════════════╝
 
 ```
 
 ## Phase 5 — Explainability (SHAP)
 
-### Top 10 Features per Pass
+### Rigor & Stability
+
+| pass_name      | target     |   stability_tau |   dual_method_tau | beats_majority   | stable   | interpretable   |
+|:---------------|:-----------|----------------:|------------------:|:-----------------|:---------|:----------------|
+| simplifycfg    | beneficial |          0.7329 |               nan | True             | True     | True            |
+| early-cse      | beneficial |          0.6591 |               nan | True             | True     | True            |
+| jump-threading | beneficial |          0.704  |               nan | True             | True     | True            |
 
 
-#### simplifycfg
-
-|   rank | feature                |   mean_abs_shap |
-|-------:|:-----------------------|----------------:|
-|      1 | int_arith_count        |        1.58415  |
-|      2 | icmp_density           |        0.234677 |
-|      3 | gep_count              |        0.20706  |
-|      4 | icmp_count             |        0.155582 |
-|      5 | load_count             |        0.154019 |
-|      6 | phi_count              |        0.129409 |
-|      7 | const_operands         |        0.1134   |
-|      8 | max_loop_depth_density |        0.091271 |
-|      9 | load_density           |        0.044967 |
-|     10 | call_count             |        0.04238  |
+### Top 10 Features per Interpretable Pass
 
 
-
-![SHAP Beeswarm — simplifycfg](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_simplifycfg.png)
-
-
-#### early-cse
+#### early-cse (target: beneficial)
 
 |   rank | feature                |   mean_abs_shap |
 |-------:|:-----------------------|----------------:|
-|      1 | gep_count              |        0.852431 |
-|      2 | icmp_density           |        0.44273  |
-|      3 | int_arith_density      |        0.314605 |
-|      4 | gep_density            |        0.260874 |
-|      5 | const_operands_density |        0.173871 |
-|      6 | const_operands         |        0.160278 |
-|      7 | int_arith_count        |        0.129164 |
-|      8 | log_inst_count         |        0.087668 |
-|      9 | cast_density           |        0.078623 |
-|     10 | cond_br_density        |        0.073601 |
+|      1 | gep_count              |        0.600701 |
+|      2 | int_arith_density      |        0.474263 |
+|      3 | icmp_density           |        0.413014 |
+|      4 | gep_density            |        0.26916  |
+|      5 | const_operands_density |        0.170599 |
+|      6 | const_operands         |        0.128084 |
+|      7 | cond_br_density        |        0.087797 |
+|      8 | cast_density           |        0.084407 |
+|      9 | blocks_2_pred_density  |        0.075509 |
+|     10 | int_arith_count        |        0.072937 |
 
 
 
-![SHAP Beeswarm — early-cse](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_early-cse.png)
+![SHAP Beeswarm — early-cse (beneficial)](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_early-cse_beneficial.png)
 
 
-#### jump-threading
-
-|   rank | feature                |   mean_abs_shap |
-|-------:|:-----------------------|----------------:|
-|      1 | int_arith_count        |        1.58252  |
-|      2 | max_loop_depth_density |        0.359054 |
-|      3 | icmp_density           |        0.270337 |
-|      4 | load_count             |        0.257256 |
-|      5 | gep_count              |        0.180554 |
-|      6 | store_count            |        0.164423 |
-|      7 | icmp_count             |        0.16438  |
-|      8 | phi_count              |        0.144543 |
-|      9 | cast_density           |        0.095449 |
-|     10 | const_operands         |        0.086655 |
-
-
-
-![SHAP Beeswarm — jump-threading](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_jump-threading.png)
-
-
-#### indvars
+#### jump-threading (target: beneficial)
 
 |   rank | feature         |   mean_abs_shap |
 |-------:|:----------------|----------------:|
-|      1 | load_count      |        0.556449 |
-|      2 | gep_count       |        0.372808 |
-|      3 | cast_density    |        0.266279 |
-|      4 | store_count     |        0.25544  |
-|      5 | icmp_count      |        0.246063 |
-|      6 | load_density    |        0.066507 |
-|      7 | icmp_density    |        0.064146 |
-|      8 | int_arith_count |        0.062666 |
-|      9 | cast_count      |        0.061151 |
-|     10 | const_operands  |        0.037972 |
+|      1 | int_arith_count |        1.48964  |
+|      2 | load_count      |        0.320793 |
+|      3 | icmp_density    |        0.259435 |
+|      4 | gep_count       |        0.172325 |
+|      5 | const_operands  |        0.166847 |
+|      6 | store_count     |        0.162641 |
+|      7 | phi_count       |        0.1545   |
+|      8 | cast_density    |        0.149208 |
+|      9 | icmp_count      |        0.13453  |
+|     10 | load_density    |        0.063055 |
 
 
 
-![SHAP Beeswarm — indvars](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_indvars.png)
+![SHAP Beeswarm — jump-threading (beneficial)](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_jump-threading_beneficial.png)
+
+
+#### simplifycfg (target: beneficial)
+
+|   rank | feature           |   mean_abs_shap |
+|-------:|:------------------|----------------:|
+|      1 | int_arith_count   |        1.39581  |
+|      2 | icmp_density      |        0.1718   |
+|      3 | gep_count         |        0.145613 |
+|      4 | icmp_count        |        0.136055 |
+|      5 | const_operands    |        0.128369 |
+|      6 | load_count        |        0.120744 |
+|      7 | phi_count         |        0.087388 |
+|      8 | int_arith_density |        0.063829 |
+|      9 | cond_br_density   |        0.044848 |
+|     10 | load_density      |        0.040442 |
+
+
+
+![SHAP Beeswarm — simplifycfg (beneficial)](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\shap\shap_beeswarm_simplifycfg_beneficial.png)
 
 ### Faithfulness Checks
 
-| pass_name      |   kendall_tau_mean |   kendall_tau_std |   top10_overlap_mean |   perm_kendall_tau |   shuffle_shap_max |   shuffle_shap_mean |
-|:---------------|-------------------:|------------------:|---------------------:|-------------------:|-------------------:|--------------------:|
-| simplifycfg    |           0.605962 |         0.0601247 |                 0.79 |             0.826  |            1.06215 |            0.038984 |
-| early-cse      |           0.593846 |         0.0699643 |                 0.9  |             0.8779 |            1.07622 |            0.032276 |
-| jump-threading |           0.638269 |         0.0623783 |                 0.88 |             0.775  |            0.93302 |            0.036441 |
-| indvars        |           0.720577 |         0.0595536 |                 0.81 |             0.925  |            0.74366 |            0.02555  |
+| pass_name      | target     |   k |   full_prauc |   shap_removed_prauc |   shap_drop |   random_removed_prauc_mean |   random_removed_prauc_std |   random_drop_mean |
+|:---------------|:-----------|----:|-------------:|---------------------:|------------:|----------------------------:|---------------------------:|-------------------:|
+| simplifycfg    | beneficial |   1 |       0.7727 |               0.9148 |     -0.142  |                      0.7838 |                     0.0347 |            -0.0111 |
+| simplifycfg    | beneficial |   3 |       0.7727 |               0.9773 |     -0.2045 |                      0.798  |                     0.052  |            -0.0253 |
+| simplifycfg    | beneficial |   5 |       0.7727 |               0.9148 |     -0.142  |                      0.802  |                     0.0529 |            -0.0293 |
+| simplifycfg    | beneficial |  10 |       0.7727 |               0.8523 |     -0.0795 |                      0.8233 |                     0.0701 |            -0.0506 |
+| early-cse      | beneficial |   1 |       0.9464 |               0.9464 |      0      |                      0.9464 |                     0      |            -0      |
+| early-cse      | beneficial |   3 |       0.9464 |               0.9464 |      0      |                      0.9464 |                     0      |            -0      |
+| early-cse      | beneficial |   5 |       0.9464 |               0.8214 |      0.125  |                      0.9464 |                     0      |            -0      |
+| early-cse      | beneficial |  10 |       0.9464 |               0.9464 |      0      |                      0.9464 |                     0      |            -0      |
+| jump-threading | beneficial |   1 |       0.9356 |               0.9773 |     -0.0417 |                      0.9335 |                     0.0207 |             0.0021 |
+| jump-threading | beneficial |   3 |       0.9356 |               0.9773 |     -0.0417 |                      0.9335 |                     0.0308 |             0.0021 |
+| jump-threading | beneficial |   5 |       0.9356 |               0.9773 |     -0.0417 |                      0.9377 |                     0.0246 |            -0.0021 |
+| jump-threading | beneficial |  10 |       0.9356 |               0.8523 |      0.0833 |                      0.9273 |                     0.0408 |             0.0083 |
 
 
-### Heuristic Agreement
+### Top 10 Feature Interactions
 
-| pass_name      |   hit_at_5 |    mrr |   direction_agreement |   random_hit_at_5 |   random_mrr |   n_heuristic_features |
-|:---------------|-----------:|-------:|----------------------:|------------------:|-------------:|-----------------------:|
-| simplifycfg    |     0      | 0.0338 |                0.3333 |            0.0615 |       0.0303 |                      4 |
-| early-cse      |     0.3333 | 0.1389 |                0      |            0.0462 |       0.0303 |                      3 |
-| jump-threading |     0      | 0.0352 |                0.5    |            0.0462 |       0.0303 |                      3 |
-| indvars        |     0      | 0.0609 |                0      |            0.0462 |       0.0303 |                      3 |
+| pass_name      | target     | feature_1       | feature_2              |   mean_abs_interaction |
+|:---------------|:-----------|:----------------|:-----------------------|-----------------------:|
+| simplifycfg    | beneficial | int_arith_count | fp_arith_count         |               0        |
+| simplifycfg    | beneficial | int_arith_count | icmp_count             |               0        |
+| simplifycfg    | beneficial | int_arith_count | fcmp_count             |               0        |
+| simplifycfg    | beneficial | int_arith_count | load_count             |               0        |
+| simplifycfg    | beneficial | int_arith_count | store_count            |               0        |
+| simplifycfg    | beneficial | int_arith_count | gep_count              |               0        |
+| simplifycfg    | beneficial | int_arith_count | alloca_count           |               0        |
+| simplifycfg    | beneficial | int_arith_count | phi_count              |               0        |
+| simplifycfg    | beneficial | int_arith_count | call_count             |               0        |
+| simplifycfg    | beneficial | int_arith_count | cast_count             |               0        |
+| early-cse      | beneficial | load_count      | const_operands_density |               0.109857 |
+| early-cse      | beneficial | gep_count       | const_operands_density |               0.046986 |
+| early-cse      | beneficial | int_arith_count | fp_arith_count         |               0        |
+| early-cse      | beneficial | int_arith_count | icmp_count             |               0        |
+| early-cse      | beneficial | int_arith_count | fcmp_count             |               0        |
+| early-cse      | beneficial | int_arith_count | load_count             |               0        |
+| early-cse      | beneficial | int_arith_count | store_count            |               0        |
+| early-cse      | beneficial | int_arith_count | gep_count              |               0        |
+| early-cse      | beneficial | int_arith_count | alloca_count           |               0        |
+| early-cse      | beneficial | int_arith_count | phi_count              |               0        |
+| jump-threading | beneficial | int_arith_count | icmp_density           |               0.022178 |
+| jump-threading | beneficial | int_arith_count | icmp_count             |               0.02093  |
+| jump-threading | beneficial | int_arith_count | fp_arith_count         |               0        |
+| jump-threading | beneficial | int_arith_count | fcmp_count             |               0        |
+| jump-threading | beneficial | int_arith_count | load_count             |               0        |
+| jump-threading | beneficial | int_arith_count | store_count            |               0        |
+| jump-threading | beneficial | int_arith_count | gep_count              |               0        |
+| jump-threading | beneficial | int_arith_count | alloca_count           |               0        |
+| jump-threading | beneficial | int_arith_count | phi_count              |               0        |
+| jump-threading | beneficial | int_arith_count | call_count             |               0        |
+
+
+### Size Confound Analysis
+
+| pass_name      | target     | feature                |   rank_without_size |   rank_with_size |
+|:---------------|:-----------|:-----------------------|--------------------:|-----------------:|
+| simplifycfg    | beneficial | int_arith_count        |                   1 |                1 |
+| simplifycfg    | beneficial | icmp_density           |                   2 |                2 |
+| simplifycfg    | beneficial | gep_count              |                   3 |                3 |
+| simplifycfg    | beneficial | icmp_count             |                   4 |                4 |
+| simplifycfg    | beneficial | fcmp_count             |                   5 |              nan |
+| simplifycfg    | beneficial | load_count             |                   6 |                6 |
+| simplifycfg    | beneficial | store_count            |                   7 |              nan |
+| simplifycfg    | beneficial | fp_arith_count         |                   8 |              nan |
+| simplifycfg    | beneficial | phi_count              |                   9 |                7 |
+| simplifycfg    | beneficial | call_count             |                  10 |              nan |
+| early-cse      | beneficial | int_arith_density      |                   1 |                2 |
+| early-cse      | beneficial | const_operands_density |                   2 |                5 |
+| early-cse      | beneficial | cast_density           |                   3 |                8 |
+| early-cse      | beneficial | gep_count              |                   4 |                1 |
+| early-cse      | beneficial | load_count             |                   5 |              nan |
+| early-cse      | beneficial | store_count            |                   6 |              nan |
+| early-cse      | beneficial | fcmp_count             |                   7 |              nan |
+| early-cse      | beneficial | icmp_count             |                   8 |              nan |
+| early-cse      | beneficial | phi_count              |                   9 |              nan |
+| early-cse      | beneficial | call_count             |                  10 |              nan |
+| jump-threading | beneficial | int_arith_count        |                   1 |                1 |
+| jump-threading | beneficial | icmp_density           |                   2 |                3 |
+| jump-threading | beneficial | cast_density           |                   3 |                8 |
+| jump-threading | beneficial | load_count             |                   4 |                2 |
+| jump-threading | beneficial | gep_count              |                   5 |                4 |
+| jump-threading | beneficial | icmp_count             |                   6 |                9 |
+| jump-threading | beneficial | fcmp_count             |                   7 |              nan |
+| jump-threading | beneficial | fp_arith_count         |                   8 |              nan |
+| jump-threading | beneficial | phi_count              |                   9 |                7 |
+| jump-threading | beneficial | call_count             |                  10 |              nan |
+
+
+### Heuristic Agreement (Permutation Test)
+
+| pass_name      | target     | heuristic_type   |   hit_at_5 |   hit_at_5_ci_lo |   hit_at_5_ci_hi |   hit_at_5_p |    mrr |   mrr_ci_lo |   mrr_ci_hi |   mrr_p |   cross_pass_mean_hit5 |   cross_pass_mean_mrr | beats_others   |   n_heuristic_features |   hit_at_5_p_holm |   mrr_p_holm |
+|:---------------|:-----------|:-----------------|-----------:|-----------------:|-----------------:|-------------:|-------:|------------:|------------:|--------:|-----------------------:|----------------------:|:---------------|-----------------------:|------------------:|-------------:|
+| simplifycfg    | beneficial | applicability    |          0 |                0 |                0 |            1 | 0.0614 |      0.0204 |      0.1111 |  0.3188 |                 0.0588 |                0.0799 | False          |                      3 |                 1 |       0.9564 |
+| early-cse      | beneficial | applicability    |          0 |                0 |                0 |            1 | 0.0714 |      0.0714 |      0.0714 |  0.2079 |                 0.1765 |                0.1106 | False          |                      1 |                 1 |       0.855  |
+| early-cse      | beneficial | cost_model       |          0 |                0 |                0 |            1 | 0.0159 |      0.0159 |      0.0159 |  0.9264 |                 0      |                0.03   | False          |                      1 |                 1 |       1      |
+| jump-threading | beneficial | applicability    |          0 |                0 |                0 |            1 | 0.0833 |      0.0833 |      0.0833 |  0.171  |                 0.0588 |                0.063  | True           |                      1 |                 1 |       0.855  |
+| jump-threading | beneficial | cost_model       |          0 |                0 |                0 |            1 | 0.0159 |      0.0159 |      0.0159 |  0.9264 |                 0      |                0.0289 | False          |                      1 |                 1 |       1      |
 
 
 ### Candidate Novel Drivers
 
-| pass_name      | feature                |   shap_rank |   mean_abs_shap |
-|:---------------|:-----------------------|------------:|----------------:|
-| simplifycfg    | int_arith_count        |           1 |        1.58415  |
-| simplifycfg    | icmp_density           |           2 |        0.234677 |
-| simplifycfg    | gep_count              |           3 |        0.20706  |
-| simplifycfg    | icmp_count             |           4 |        0.155582 |
-| simplifycfg    | load_count             |           5 |        0.154019 |
-| simplifycfg    | phi_count              |           6 |        0.129409 |
-| simplifycfg    | const_operands         |           7 |        0.1134   |
-| simplifycfg    | max_loop_depth_density |           8 |        0.091271 |
-| simplifycfg    | load_density           |           9 |        0.044967 |
-| simplifycfg    | call_count             |          10 |        0.04238  |
-| early-cse      | gep_count              |           1 |        0.852431 |
-| early-cse      | icmp_density           |           2 |        0.44273  |
-| early-cse      | gep_density            |           4 |        0.260874 |
-| early-cse      | const_operands_density |           5 |        0.173871 |
-| early-cse      | const_operands         |           6 |        0.160278 |
-| early-cse      | int_arith_count        |           7 |        0.129164 |
-| early-cse      | log_inst_count         |           8 |        0.087668 |
-| early-cse      | cast_density           |           9 |        0.078623 |
-| early-cse      | cond_br_density        |          10 |        0.073601 |
-| jump-threading | int_arith_count        |           1 |        1.58252  |
-| jump-threading | max_loop_depth_density |           2 |        0.359054 |
-| jump-threading | icmp_density           |           3 |        0.270337 |
-| jump-threading | load_count             |           4 |        0.257256 |
-| jump-threading | gep_count              |           5 |        0.180554 |
-| jump-threading | store_count            |           6 |        0.164423 |
-| jump-threading | icmp_count             |           7 |        0.16438  |
-| jump-threading | phi_count              |           8 |        0.144543 |
-| jump-threading | cast_density           |           9 |        0.095449 |
-| jump-threading | const_operands         |          10 |        0.086655 |
-| indvars        | load_count             |           1 |        0.556449 |
-| indvars        | gep_count              |           2 |        0.372808 |
-| indvars        | cast_density           |           3 |        0.266279 |
-| indvars        | store_count            |           4 |        0.25544  |
-| indvars        | icmp_count             |           5 |        0.246063 |
-| indvars        | load_density           |           6 |        0.066507 |
-| indvars        | int_arith_count        |           8 |        0.062666 |
-| indvars        | cast_count             |           9 |        0.061151 |
-| indvars        | const_operands         |          10 |        0.037972 |
+| pass_name      | target     | feature                |   shap_rank |   mean_abs_shap |
+|:---------------|:-----------|:-----------------------|------------:|----------------:|
+| simplifycfg    | beneficial | int_arith_count        |           1 |        1.39581  |
+| simplifycfg    | beneficial | icmp_density           |           2 |        0.1718   |
+| simplifycfg    | beneficial | gep_count              |           3 |        0.145613 |
+| simplifycfg    | beneficial | icmp_count             |           4 |        0.136055 |
+| simplifycfg    | beneficial | const_operands         |           5 |        0.128369 |
+| simplifycfg    | beneficial | load_count             |           6 |        0.120744 |
+| simplifycfg    | beneficial | phi_count              |           7 |        0.087388 |
+| simplifycfg    | beneficial | int_arith_density      |           8 |        0.063829 |
+| simplifycfg    | beneficial | load_density           |          10 |        0.040442 |
+| early-cse      | beneficial | gep_count              |           1 |        0.600701 |
+| early-cse      | beneficial | int_arith_density      |           2 |        0.474263 |
+| early-cse      | beneficial | icmp_density           |           3 |        0.413014 |
+| early-cse      | beneficial | gep_density            |           4 |        0.26916  |
+| early-cse      | beneficial | const_operands_density |           5 |        0.170599 |
+| early-cse      | beneficial | const_operands         |           6 |        0.128084 |
+| early-cse      | beneficial | cond_br_density        |           7 |        0.087797 |
+| early-cse      | beneficial | cast_density           |           8 |        0.084407 |
+| early-cse      | beneficial | blocks_2_pred_density  |           9 |        0.075509 |
+| early-cse      | beneficial | int_arith_count        |          10 |        0.072937 |
+| jump-threading | beneficial | int_arith_count        |           1 |        1.48964  |
+| jump-threading | beneficial | load_count             |           2 |        0.320793 |
+| jump-threading | beneficial | icmp_density           |           3 |        0.259435 |
+| jump-threading | beneficial | gep_count              |           4 |        0.172325 |
+| jump-threading | beneficial | const_operands         |           5 |        0.166847 |
+| jump-threading | beneficial | store_count            |           6 |        0.162641 |
+| jump-threading | beneficial | phi_count              |           7 |        0.1545   |
+| jump-threading | beneficial | cast_density           |           8 |        0.149208 |
+| jump-threading | beneficial | icmp_count             |           9 |        0.13453  |
+| jump-threading | beneficial | load_density           |          10 |        0.063055 |
+
+
+### Phase 5 Gating Summary
+
+| pass_name              | target     | status      | reason                           |
+|:-----------------------|:-----------|:------------|:---------------------------------|
+| sroa                   | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| sroa                   | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| instcombine            | beneficial | dropped     | Failed model training / XGate    |
+| instcombine            | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| simplifycfg            | beneficial | interpreted | Stable & beats majority          |
+| simplifycfg            | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| early-cse              | beneficial | interpreted | Stable & beats majority          |
+| early-cse              | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| gvn                    | beneficial | dropped     | Failed model training / XGate    |
+| gvn                    | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| sccp                   | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| sccp                   | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| adce                   | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| adce                   | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| dse                    | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| dse                    | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| reassociate            | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| reassociate            | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| jump-threading         | beneficial | interpreted | Stable & beats majority          |
+| jump-threading         | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| correlated-propagation | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| correlated-propagation | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| licm                   | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| licm                   | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-rotate            | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-rotate            | harmful    | dropped     | Failed model training / XGate    |
+| indvars                | beneficial | dropped     | Failed model training / XGate    |
+| indvars                | harmful    | dropped     | Failed model training / XGate    |
+| loop-deletion          | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-deletion          | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-idiom             | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-idiom             | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-unroll            | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| loop-unroll            | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
+| tailcallelim           | beneficial | dropped     | Pos rate out of bounds [5%, 95%] |
+| tailcallelim           | harmful    | dropped     | Pos rate out of bounds [5%, 95%] |
 
 
 
@@ -264,9 +425,10 @@
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 5 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Passes analyzed:               5                     ║
-║ Feature clusters:             24                     ║
-║ Novel driver candidates:      38                     ║
+║ Passes analyzed:               3                     ║
+║ Targets:                       2                     ║
+║ Interpretable (pass):          3                     ║
+║ Stability threshold:     tau>=0.6                     ║
 ╚══════════════════════════════════════════════════════╝
 
 ```
@@ -275,109 +437,82 @@
 
 | pass_name      | method      |   k |   pr_auc_mean |   pr_auc_std |   model_size_mean |   inference_ms_mean |
 |:---------------|:------------|----:|--------------:|-------------:|------------------:|--------------------:|
-| early-cse      | mutual_info |   5 |      0.7842   |    0.19153   |               200 |            0.536667 |
-| early-cse      | mutual_info |  10 |      0.8901   |    0.0565517 |               200 |            0.486667 |
-| early-cse      | mutual_info |  15 |      0.8901   |    0.0565517 |               200 |            0.61     |
-| early-cse      | mutual_info |  20 |      0.8901   |    0.0565517 |               200 |            0.583333 |
-| early-cse      | mutual_info |  30 |      0.806767 |    0.195529  |               200 |            0.6      |
-| early-cse      | mutual_info |  65 |      0.945667 |    0.0547037 |               200 |            0.546667 |
-| early-cse      | random      |   5 |      0.686967 |    0.243224  |               200 |            0.55     |
-| early-cse      | random      |  10 |      0.654    |    0.264241  |               200 |            0.673333 |
-| early-cse      | random      |  15 |      0.945667 |    0.0547037 |               200 |            0.67     |
-| early-cse      | random      |  20 |      0.945667 |    0.0547037 |               200 |            0.613333 |
-| early-cse      | random      |  30 |      0.945667 |    0.0547037 |               200 |            0.506667 |
-| early-cse      | random      |  65 |      0.945667 |    0.0547037 |               200 |            0.733333 |
-| early-cse      | shap        |   5 |      0.945667 |    0.0547037 |               200 |            0.49     |
-| early-cse      | shap        |  10 |      0.945667 |    0.0547037 |               200 |            0.543333 |
-| early-cse      | shap        |  15 |      0.945667 |    0.0547037 |               200 |            0.51     |
-| early-cse      | shap        |  20 |      0.945667 |    0.0547037 |               200 |            0.566667 |
-| early-cse      | shap        |  30 |      0.945667 |    0.0547037 |               200 |            0.67     |
-| early-cse      | shap        |  65 |      0.945667 |    0.0547037 |               200 |            0.683333 |
-| early-cse      | xgb_gain    |   5 |      0.945667 |    0.0547037 |               200 |            0.636667 |
-| early-cse      | xgb_gain    |  10 |      0.945667 |    0.0547037 |               200 |            0.586667 |
-| early-cse      | xgb_gain    |  15 |      0.945667 |    0.0547037 |               200 |            0.543333 |
-| early-cse      | xgb_gain    |  20 |      0.945667 |    0.0547037 |               200 |            0.586667 |
-| early-cse      | xgb_gain    |  30 |      0.945667 |    0.0547037 |               200 |            0.63     |
-| early-cse      | xgb_gain    |  65 |      0.945667 |    0.0547037 |               200 |            0.71     |
-| indvars        | mutual_info |   5 |      1        |    0         |               200 |            0.57     |
-| indvars        | mutual_info |  10 |      1        |    0         |               200 |            0.605    |
-| indvars        | mutual_info |  15 |      0.75     |    0.353553  |               200 |            0.515    |
-| indvars        | mutual_info |  20 |      0.5      |    0         |               200 |            0.535    |
-| indvars        | mutual_info |  30 |      1        |    0         |               200 |            0.545    |
-| indvars        | mutual_info |  65 |      1        |    0         |               200 |            0.59     |
-| indvars        | random      |   5 |      0.75     |    0.353553  |               200 |            0.55     |
-| indvars        | random      |  10 |      0.75     |    0.353553  |               200 |            0.605    |
-| indvars        | random      |  15 |      0.66665  |    0.471428  |               200 |            0.52     |
-| indvars        | random      |  20 |      0.66665  |    0.471428  |               200 |            0.49     |
-| indvars        | random      |  30 |      1        |    0         |               200 |            0.47     |
-| indvars        | random      |  65 |      1        |    0         |               200 |            0.615    |
-| indvars        | shap        |   5 |      1        |    0         |               200 |            0.49     |
-| indvars        | shap        |  10 |      1        |    0         |               200 |            0.495    |
-| indvars        | shap        |  15 |      1        |    0         |               200 |            0.52     |
-| indvars        | shap        |  20 |      1        |    0         |               200 |            0.49     |
-| indvars        | shap        |  30 |      1        |    0         |               200 |            0.455    |
-| indvars        | shap        |  65 |      1        |    0         |               200 |            0.58     |
-| indvars        | xgb_gain    |   5 |      1        |    0         |               200 |            0.54     |
-| indvars        | xgb_gain    |  10 |      1        |    0         |               200 |            0.58     |
-| indvars        | xgb_gain    |  15 |      1        |    0         |               200 |            0.49     |
-| indvars        | xgb_gain    |  20 |      1        |    0         |               200 |            0.485    |
-| indvars        | xgb_gain    |  30 |      1        |    0         |               200 |            0.445    |
-| indvars        | xgb_gain    |  65 |      1        |    0         |               200 |            0.595    |
-| jump-threading | mutual_info |   5 |      0.879933 |    0.117097  |               200 |            0.55     |
-| jump-threading | mutual_info |  10 |      0.879933 |    0.117097  |               200 |            0.573333 |
-| jump-threading | mutual_info |  15 |      0.879933 |    0.117097  |               200 |            0.573333 |
-| jump-threading | mutual_info |  20 |      0.866033 |    0.101149  |               200 |            0.63     |
-| jump-threading | mutual_info |  30 |      0.866033 |    0.101149  |               200 |            0.57     |
-| jump-threading | mutual_info |  65 |      0.838267 |    0.0821539 |               200 |            0.543333 |
-| jump-threading | random      |   5 |      0.8327   |    0.0824016 |               200 |            0.493333 |
-| jump-threading | random      |  10 |      0.8313   |    0.0949136 |               200 |            0.516667 |
-| jump-threading | random      |  15 |      0.822967 |    0.0989541 |               200 |            0.66     |
-| jump-threading | random      |  20 |      0.822967 |    0.0989541 |               200 |            0.566667 |
-| jump-threading | random      |  30 |      0.8091   |    0.052971  |               200 |            0.616667 |
-| jump-threading | random      |  65 |      0.838267 |    0.0821539 |               200 |            0.626667 |
-| jump-threading | shap        |   5 |      0.838267 |    0.0821539 |               200 |            0.5      |
-| jump-threading | shap        |  10 |      0.838267 |    0.0821539 |               200 |            0.56     |
-| jump-threading | shap        |  15 |      0.838267 |    0.0821539 |               200 |            0.576667 |
-| jump-threading | shap        |  20 |      0.838267 |    0.0821539 |               200 |            0.633333 |
-| jump-threading | shap        |  30 |      0.838267 |    0.0821539 |               200 |            0.593333 |
-| jump-threading | shap        |  65 |      0.838267 |    0.0821539 |               200 |            0.603333 |
-| jump-threading | xgb_gain    |   5 |      0.838267 |    0.0821539 |               200 |            0.563333 |
-| jump-threading | xgb_gain    |  10 |      0.838267 |    0.0821539 |               200 |            0.73     |
-| jump-threading | xgb_gain    |  15 |      0.838267 |    0.0821539 |               200 |            0.683333 |
-| jump-threading | xgb_gain    |  20 |      0.838267 |    0.0821539 |               200 |            0.586667 |
-| jump-threading | xgb_gain    |  30 |      0.838267 |    0.0821539 |               200 |            0.57     |
-| jump-threading | xgb_gain    |  65 |      0.838267 |    0.0821539 |               200 |            0.633333 |
-| simplifycfg    | mutual_info |   5 |      0.9091   |    0.138251  |               200 |            0.623333 |
-| simplifycfg    | mutual_info |  10 |      0.9091   |    0.138251  |               200 |            0.536667 |
-| simplifycfg    | mutual_info |  15 |      0.9091   |    0.138251  |               200 |            0.546667 |
-| simplifycfg    | mutual_info |  20 |      0.8952   |    0.129804  |               200 |            0.563333 |
-| simplifycfg    | mutual_info |  30 |      0.867433 |    0.125685  |               200 |            0.516667 |
-| simplifycfg    | mutual_info |  65 |      0.867433 |    0.125685  |               200 |            0.503333 |
-| simplifycfg    | random      |   5 |      0.850367 |    0.132081  |               200 |            4.31     |
-| simplifycfg    | random      |  10 |      0.867433 |    0.125685  |               200 |            5.00667  |
-| simplifycfg    | random      |  15 |      0.867433 |    0.125685  |               200 |            0.593333 |
-| simplifycfg    | random      |  20 |      0.867433 |    0.125685  |               200 |            0.603333 |
-| simplifycfg    | random      |  30 |      0.867433 |    0.125685  |               200 |            0.55     |
-| simplifycfg    | random      |  65 |      0.867433 |    0.125685  |               200 |            0.633333 |
-| simplifycfg    | shap        |   5 |      0.867433 |    0.125685  |               200 |            5.54     |
-| simplifycfg    | shap        |  10 |      0.867433 |    0.125685  |               200 |            6.69667  |
-| simplifycfg    | shap        |  15 |      0.867433 |    0.125685  |               200 |            0.836667 |
-| simplifycfg    | shap        |  20 |      0.867433 |    0.125685  |               200 |            0.59     |
-| simplifycfg    | shap        |  30 |      0.867433 |    0.125685  |               200 |            3.63667  |
-| simplifycfg    | shap        |  65 |      0.867433 |    0.125685  |               200 |            0.556667 |
-| simplifycfg    | xgb_gain    |   5 |      0.867433 |    0.125685  |               200 |            0.713333 |
-| simplifycfg    | xgb_gain    |  10 |      0.867433 |    0.125685  |               200 |            0.633333 |
-| simplifycfg    | xgb_gain    |  15 |      0.867433 |    0.125685  |               200 |            0.593333 |
+| early-cse      | mutual_info |   5 |      0.839767 |    0.232662  |               200 |            0.616667 |
+| early-cse      | mutual_info |  10 |      0.9092   |    0.114045  |               200 |            0.616667 |
+| early-cse      | mutual_info |  15 |      0.9092   |    0.114045  |               200 |            0.586667 |
+| early-cse      | mutual_info |  20 |      0.9092   |    0.114045  |               200 |            0.556667 |
+| early-cse      | mutual_info |  30 |      0.945667 |    0.0547037 |               200 |            0.503333 |
+| early-cse      | mutual_info |  68 |      0.945667 |    0.0547037 |               200 |            0.513333 |
+| early-cse      | random      |   5 |      0.867533 |    0.116467  |               200 |            0.56     |
+| early-cse      | random      |  10 |      0.857133 |    0.128774  |               200 |            0.61     |
+| early-cse      | random      |  15 |      0.867533 |    0.116467  |               200 |            0.526667 |
+| early-cse      | random      |  20 |      0.9092   |    0.114045  |               200 |            0.576667 |
+| early-cse      | random      |  30 |      0.9092   |    0.114045  |               200 |            0.543333 |
+| early-cse      | random      |  68 |      0.945667 |    0.0547037 |               200 |            0.516667 |
+| early-cse      | shap        |   5 |      0.945667 |    0.0547037 |               200 |            0.97     |
+| early-cse      | shap        |  10 |      0.945667 |    0.0547037 |               200 |            0.536667 |
+| early-cse      | shap        |  15 |      0.945667 |    0.0547037 |               200 |            0.53     |
+| early-cse      | shap        |  20 |      0.945667 |    0.0547037 |               200 |            0.526667 |
+| early-cse      | shap        |  30 |      0.945667 |    0.0547037 |               200 |            0.573333 |
+| early-cse      | shap        |  68 |      0.945667 |    0.0547037 |               200 |            0.596667 |
+| early-cse      | xgb_gain    |   5 |      0.945667 |    0.0547037 |               200 |            0.506667 |
+| early-cse      | xgb_gain    |  10 |      0.945667 |    0.0547037 |               200 |            0.563333 |
+| early-cse      | xgb_gain    |  15 |      0.945667 |    0.0547037 |               200 |            0.51     |
+| early-cse      | xgb_gain    |  20 |      0.945667 |    0.0547037 |               200 |            0.59     |
+| early-cse      | xgb_gain    |  30 |      0.945667 |    0.0547037 |               200 |            0.69     |
+| early-cse      | xgb_gain    |  68 |      0.945667 |    0.0547037 |               200 |            0.656667 |
+| jump-threading | mutual_info |   5 |      0.863267 |    0.113652  |               200 |            0.626667 |
+| jump-threading | mutual_info |  10 |      0.850767 |    0.11582   |               200 |            0.656667 |
+| jump-threading | mutual_info |  15 |      0.850767 |    0.11582   |               200 |            0.67     |
+| jump-threading | mutual_info |  20 |      0.866033 |    0.101149  |               200 |            0.66     |
+| jump-threading | mutual_info |  30 |      0.866033 |    0.101149  |               200 |            0.6      |
+| jump-threading | mutual_info |  68 |      0.838267 |    0.0821539 |               200 |            0.64     |
+| jump-threading | random      |   5 |      0.879933 |    0.117097  |               200 |            0.596667 |
+| jump-threading | random      |  10 |      0.838267 |    0.0821539 |               200 |            0.653333 |
+| jump-threading | random      |  15 |      0.8216   |    0.0622168 |               200 |            0.563333 |
+| jump-threading | random      |  20 |      0.8216   |    0.0622168 |               200 |            0.58     |
+| jump-threading | random      |  30 |      0.8216   |    0.0622168 |               200 |            0.623333 |
+| jump-threading | random      |  68 |      0.838267 |    0.0821539 |               200 |            0.596667 |
+| jump-threading | shap        |   5 |      0.838267 |    0.0821539 |               200 |            0.65     |
+| jump-threading | shap        |  10 |      0.838267 |    0.0821539 |               200 |            0.616667 |
+| jump-threading | shap        |  15 |      0.838267 |    0.0821539 |               200 |            0.59     |
+| jump-threading | shap        |  20 |      0.838267 |    0.0821539 |               200 |            0.6      |
+| jump-threading | shap        |  30 |      0.838267 |    0.0821539 |               200 |            0.613333 |
+| jump-threading | shap        |  68 |      0.838267 |    0.0821539 |               200 |            0.676667 |
+| jump-threading | xgb_gain    |   5 |      0.838267 |    0.0821539 |               200 |            0.653333 |
+| jump-threading | xgb_gain    |  10 |      0.838267 |    0.0821539 |               200 |            0.62     |
+| jump-threading | xgb_gain    |  15 |      0.838267 |    0.0821539 |               200 |            0.56     |
+| jump-threading | xgb_gain    |  20 |      0.838267 |    0.0821539 |               200 |            0.643333 |
+| jump-threading | xgb_gain    |  30 |      0.838267 |    0.0821539 |               200 |            0.666667 |
+| jump-threading | xgb_gain    |  68 |      0.838267 |    0.0821539 |               200 |            0.753333 |
+| simplifycfg    | mutual_info |   5 |      0.888267 |    0.127095  |               200 |            0.713333 |
+| simplifycfg    | mutual_info |  10 |      0.888267 |    0.127095  |               200 |            0.713333 |
+| simplifycfg    | mutual_info |  15 |      0.9091   |    0.138251  |               200 |            0.736667 |
+| simplifycfg    | mutual_info |  20 |      0.9091   |    0.138251  |               200 |            0.726667 |
+| simplifycfg    | mutual_info |  30 |      0.867433 |    0.125685  |               200 |            0.716667 |
+| simplifycfg    | mutual_info |  68 |      0.867433 |    0.125685  |               200 |            0.79     |
+| simplifycfg    | random      |   5 |      0.8952   |    0.129804  |               200 |            0.706667 |
+| simplifycfg    | random      |  10 |      0.8409   |    0.138251  |               200 |            0.77     |
+| simplifycfg    | random      |  15 |      0.867433 |    0.125685  |               200 |            0.706667 |
+| simplifycfg    | random      |  20 |      0.867433 |    0.125685  |               200 |            0.74     |
+| simplifycfg    | random      |  30 |      0.867433 |    0.125685  |               200 |            0.68     |
+| simplifycfg    | random      |  68 |      0.867433 |    0.125685  |               200 |            0.74     |
+| simplifycfg    | shap        |   5 |      0.867433 |    0.125685  |               200 |            0.716667 |
+| simplifycfg    | shap        |  10 |      0.867433 |    0.125685  |               200 |            0.733333 |
+| simplifycfg    | shap        |  15 |      0.867433 |    0.125685  |               200 |            0.703333 |
+| simplifycfg    | shap        |  20 |      0.867433 |    0.125685  |               200 |            0.7      |
+| simplifycfg    | shap        |  30 |      0.867433 |    0.125685  |               200 |            0.713333 |
+| simplifycfg    | shap        |  68 |      0.867433 |    0.125685  |               200 |            0.7      |
+| simplifycfg    | xgb_gain    |   5 |      0.867433 |    0.125685  |               200 |            0.706667 |
+| simplifycfg    | xgb_gain    |  10 |      0.867433 |    0.125685  |               200 |            0.693333 |
+| simplifycfg    | xgb_gain    |  15 |      0.867433 |    0.125685  |               200 |            0.723333 |
 | simplifycfg    | xgb_gain    |  20 |      0.867433 |    0.125685  |               200 |            0.706667 |
-| simplifycfg    | xgb_gain    |  30 |      0.867433 |    0.125685  |               200 |            5.14     |
-| simplifycfg    | xgb_gain    |  65 |      0.867433 |    0.125685  |               200 |            0.593333 |
+| simplifycfg    | xgb_gain    |  30 |      0.867433 |    0.125685  |               200 |            0.703333 |
+| simplifycfg    | xgb_gain    |  68 |      0.867433 |    0.125685  |               200 |            0.803333 |
 
 
 
 ![Pruning Curve — early-cse](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\pruning\pruning_early-cse.png)
-
-
-![Pruning Curve — indvars](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\pruning\pruning_indvars.png)
 
 
 ![Pruning Curve — jump-threading](C:\Users\Aarush Gupta\Downloads\LLVM Project\results\figures\pruning\pruning_jump-threading.png)
@@ -387,13 +522,13 @@
 
 ## Phase 7 — Sequence-Level Evaluation
 
-| method   |   mean_reduction |   median_reduction |   mean_final_count |
-|:---------|-----------------:|-------------------:|-------------------:|
-| greedy   |         0.178875 |            0.1678  |              47    |
-| Oz       |         0.1868   |            0.21645 |              46.25 |
-| O2       |         0.0832   |            0.20635 |              52    |
-| random   |         0.141275 |            0.1254  |              49.25 |
-| oracle   |         0.227975 |            0.25885 |              43.75 |
+| method   |   geomean_size_ratio |   ci_lo |   ci_hi |   mean_reduction |
+|:---------|---------------------:|--------:|--------:|-----------------:|
+| greedy   |               0.8159 |  0.8159 |  0.8159 |           0.1789 |
+| Oz       |               0.8023 |  0.8023 |  0.8023 |           0.1868 |
+| O2       |               0.8544 |  0.8544 |  0.8544 |           0.0832 |
+| random   |               0.8495 |  0.8495 |  0.8495 |           0.1413 |
+| oracle   |               0.7651 |  0.7651 |  0.7651 |           0.228  |
 
 
 
@@ -409,11 +544,11 @@
 ║              PHASE 7 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
 ║ Held-out functions:            4                     ║
-║ Greedy mean reduction:     17.9%%                    ║
-║ -Oz mean reduction:        18.7%%                    ║
-║ -O2 mean reduction:         8.3%%                    ║
-║ Random mean reduction:     14.1%%                    ║
-║ Oracle mean reduction:     22.8%%                    ║
+║ Greedy geomean ratio:     0.8159                     ║
+║ -Oz geomean ratio:        0.8023                     ║
+║ -O2 geomean ratio:        0.8544                     ║
+║ Random geomean ratio:     0.8495                     ║
+║ Oracle geomean ratio:     0.7651                     ║
 ╚══════════════════════════════════════════════════════╝
 
 ```

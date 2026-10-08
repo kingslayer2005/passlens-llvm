@@ -61,11 +61,11 @@ RANDOM_SEED = 42
 # ============================================================================
 
 def load_models(models_dir: Path, passes: list) -> dict:
-    """Load saved XGBoost models for each pass."""
+    """Load saved XGBoost models for each pass (using the 'beneficial' target)."""
     import pickle
     models = {}
     for pass_name in passes:
-        model_path = models_dir / f"xgb_{pass_name}.pkl"
+        model_path = models_dir / f"xgb_{pass_name}_beneficial.pkl"
         if model_path.exists():
             with open(model_path, "rb") as f:
                 models[pass_name] = pickle.load(f)
@@ -366,32 +366,54 @@ def run_phase7(smoke: bool = False):
     df_results.to_csv(RESULTS_DIR / "phase7_sequence.csv", index=False)
     log.info("Sequence results saved to %s", RESULTS_DIR / "phase7_sequence.csv")
 
-    # Summary statistics
-    summary = {
-        "method": ["greedy", "Oz", "O2", "random", "oracle"],
-        "mean_reduction": [
-            df_results["greedy_reduction"].mean(),
-            df_results["oz_reduction"].mean(),
-            df_results["o2_reduction"].mean(),
-            df_results["random_reduction"].mean(),
-            df_results["oracle_reduction"].mean(),
-        ],
-        "median_reduction": [
-            df_results["greedy_reduction"].median(),
-            df_results["oz_reduction"].median(),
-            df_results["o2_reduction"].median(),
-            df_results["random_reduction"].median(),
-            df_results["oracle_reduction"].median(),
-        ],
-        "mean_final_count": [
-            df_results["greedy_count"].mean(),
-            df_results["oz_count"].mean(),
-            df_results["o2_count"].mean(),
-            df_results["random_count"].mean(),
-            df_results["oracle_count"].mean(),
-        ],
-    }
-    df_summary = pd.DataFrame(summary)
+    # ---- Geometric mean size ratio with bootstrap CIs ----
+    def geomean_ratio(method_counts, initial_counts):
+        """Geometric mean of (method_count / initial_count) across programs."""
+        ratios = method_counts / np.maximum(initial_counts, 1)
+        ratios = ratios[ratios > 0]
+        if len(ratios) == 0:
+            return 1.0
+        return float(np.exp(np.mean(np.log(ratios))))
+
+    def bootstrap_geomean_ci(method_col, initial_col, programs, n_boot=10000, alpha=0.05):
+        """Bootstrap CI for geometric mean size ratio, resampling programs."""
+        rng = np.random.RandomState(42)
+        unique_progs = np.unique(programs)
+        boot_means = []
+        for _ in range(n_boot):
+            boot_progs = rng.choice(unique_progs, len(unique_progs), replace=True)
+            boot_method = []
+            boot_init = []
+            for p in boot_progs:
+                mask = programs == p
+                boot_method.extend(method_col[mask])
+                boot_init.extend(initial_col[mask])
+            boot_method = np.array(boot_method)
+            boot_init = np.array(boot_init)
+            boot_means.append(geomean_ratio(boot_method, boot_init))
+        boot_means = np.array(boot_means)
+        return (float(np.percentile(boot_means, 100 * alpha / 2)),
+                float(np.percentile(boot_means, 100 * (1 - alpha / 2))))
+
+    programs_arr = df_results["program"].values
+    initial_arr = df_results["initial_count"].values.astype(float)
+
+    summary_rows = []
+    for method, col in [("greedy", "greedy_count"), ("Oz", "oz_count"),
+                         ("O2", "o2_count"), ("random", "random_count"),
+                         ("oracle", "oracle_count")]:
+        method_arr = df_results[col].values.astype(float)
+        gm = geomean_ratio(method_arr, initial_arr)
+        ci_lo, ci_hi = bootstrap_geomean_ci(method_arr, initial_arr, programs_arr)
+        summary_rows.append({
+            "method": method,
+            "geomean_size_ratio": round(gm, 4),
+            "ci_lo": round(ci_lo, 4),
+            "ci_hi": round(ci_hi, 4),
+            "mean_reduction": round(float(df_results[col.replace("_count", "_reduction")].mean()), 4),
+        })
+
+    df_summary = pd.DataFrame(summary_rows)
     df_summary.to_csv(RESULTS_DIR / "phase7_summary.csv", index=False)
     log.info("Summary:\n%s", df_summary.to_string())
 
@@ -399,23 +421,25 @@ def run_phase7(smoke: bool = False):
     seq_fig_dir = FIGURES_DIR / "sequence"
     seq_fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # Bar chart of mean reductions
     fig, ax = plt.subplots(figsize=(8, 5))
     methods = df_summary["method"]
-    reductions = df_summary["mean_reduction"] * 100
+    ratios = df_summary["geomean_size_ratio"]
+    ci_lo = df_summary["ci_lo"]
+    ci_hi = df_summary["ci_hi"]
     colors = ["#2196F3", "#4CAF50", "#FF9800", "#9E9E9E", "#E91E63"]
-    bars = ax.bar(methods, reductions, color=colors, edgecolor="black", linewidth=0.5)
-    ax.set_ylabel("Mean Instruction Reduction (%)")
-    ax.set_title("Sequence-Level Optimization Comparison")
+    bars = ax.bar(methods, ratios, color=colors, edgecolor="black", linewidth=0.5)
+    ax.errorbar(range(len(methods)), ratios,
+                yerr=[ratios - ci_lo, ci_hi - ratios],
+                fmt="none", color="black", capsize=5)
+    ax.set_ylabel("Geometric Mean Size Ratio (lower is better)")
+    ax.set_title("Sequence-Level Optimization — Geometric Mean Size Ratio")
+    ax.axhline(y=1.0, color="red", linestyle="--", alpha=0.5, label="No change")
+    ax.legend()
     ax.grid(axis="y", alpha=0.3)
-    for bar, val in zip(bars, reductions):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                f"{val:.1f}%", ha="center", va="bottom", fontsize=10)
     plt.tight_layout()
     plt.savefig(seq_fig_dir / "sequence_comparison.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # Box plot of per-function reductions
     fig, ax = plt.subplots(figsize=(10, 6))
     data = [
         df_results["greedy_reduction"] * 100,
@@ -442,11 +466,11 @@ def run_phase7(smoke: bool = False):
 ║              PHASE 7 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
 ║ Held-out functions:     {len(results):>8}                     ║
-║ Greedy mean reduction:  {df_results['greedy_reduction'].mean()*100:>7.1f}%%                    ║
-║ -Oz mean reduction:     {df_results['oz_reduction'].mean()*100:>7.1f}%%                    ║
-║ -O2 mean reduction:     {df_results['o2_reduction'].mean()*100:>7.1f}%%                    ║
-║ Random mean reduction:  {df_results['random_reduction'].mean()*100:>7.1f}%%                    ║
-║ Oracle mean reduction:  {df_results['oracle_reduction'].mean()*100:>7.1f}%%                    ║
+║ Greedy geomean ratio:   {df_summary[df_summary['method']=='greedy']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
+║ -Oz geomean ratio:      {df_summary[df_summary['method']=='Oz']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
+║ -O2 geomean ratio:      {df_summary[df_summary['method']=='O2']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
+║ Random geomean ratio:   {df_summary[df_summary['method']=='random']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
+║ Oracle geomean ratio:   {df_summary[df_summary['method']=='oracle']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
 ╚══════════════════════════════════════════════════════╝
 """
     log.info(report)

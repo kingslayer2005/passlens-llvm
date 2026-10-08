@@ -2,8 +2,8 @@
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 6 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Passes evaluated:              5                     ║
-║ Total experiments:           264                     ║
+║ Passes evaluated:              3                     ║
+║ Total experiments:           216                     ║
 ║ K values tested:            [5, 10, 15, 20, 30, 'all']║
 ║ Selection methods:             4                     ║
 ╚══════════════════════════════════════════════════════╝

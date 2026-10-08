@@ -2,7 +2,8 @@
 ╔══════════════════════════════════════════════════════╗
 ║              PHASE 5 GATE REPORT                     ║
 ╠══════════════════════════════════════════════════════╣
-║ Passes analyzed:               5                     ║
-║ Feature clusters:             24                     ║
-║ Novel driver candidates:      38                     ║
+║ Passes analyzed:               3                     ║
+║ Targets:                       2                     ║
+║ Interpretable (pass):          3                     ║
+║ Stability threshold:     tau>=0.6                     ║
 ╚══════════════════════════════════════════════════════╝
