@@ -71,7 +71,7 @@ early-cse:
       beneficial: high
       harmful: low
       source: "Larger blocks offer more local CSE opportunities"
-
+      verified: false
   cost_model: []
 
 gvn:
@@ -106,12 +106,12 @@ adce:
       beneficial: low
       harmful: low
       source: "Fewer stores implies fewer side effects, meaning more dead code."
-
+      verified: false
     - name: call_density
       beneficial: low
       harmful: low
       source: "Fewer calls implies fewer side effects."
-
+      verified: false
   cost_model: []
 
 dse:
@@ -146,10 +146,9 @@ jump-threading:
     - name: mean_insts_per_bb
       direction: threshold
       threshold: 6
-      crossover: 3.935483932495117
       option: "jump-threading-threshold"
       source: "Small blocks are more likely to be threaded without exceeding duplication thresholds"
-      verified: true
+      verified: false
 
 correlated-propagation:
   description: "Correlated Value Propagation"
@@ -183,14 +182,14 @@ loop-rotate:
       beneficial: high
       harmful: high
       source: "Loop rotate requires loops."
-
+      verified: false
   cost_model:
     - name: max_loop_header_size
       direction: threshold
       threshold: 16
       option: "rotation-max-header-size"
       source: "Loop rotate duplicates the header block; small headers are preferred to minimize code growth."
-      verified: true
+      verified: false
 
 indvars:
   description: "Induction Variable Simplification"
@@ -199,12 +198,12 @@ indvars:
       beneficial: high
       harmful: high
       source: "Requires loops."
-
+      verified: false
     - name: phi_density
       beneficial: high
       harmful: high
       source: "Needs phi nodes for IVs."
-
+      verified: false
   cost_model: []
 
 loop-deletion:
@@ -229,12 +228,12 @@ loop-idiom:
       beneficial: high
       harmful: high
       source: "Requires loops."
-
+      verified: false
     - name: store_density
       beneficial: high
       harmful: high
       source: "Requires stores for memset/memcpy recognition."
-
+      verified: false
   cost_model: []
 
 loop-unroll:
@@ -244,14 +243,14 @@ loop-unroll:
       beneficial: high
       harmful: high
       source: "Requires loops."
-
+      verified: false
   cost_model:
     - name: innermost_loop_body_size
       direction: threshold
       threshold: 150
       option: "unroll-threshold"
       source: "Loop unroll has a size threshold; large bodies are less likely to be fully unrolled or will increase size severely."
-      verified: true
+      verified: false
 
 tailcallelim:
   description: "Tail Call Elimination"
@@ -260,10 +259,10 @@ tailcallelim:
       beneficial: high
       harmful: high
       source: "Requires calls."
-
+      verified: false
     - name: self_recursive_call_density
       beneficial: high
       harmful: high
       source: "Commonly targets self-recursive tail calls."
-
+      verified: false
   cost_model: []

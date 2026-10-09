@@ -8,79 +8,32 @@ Run on Linux (Ubuntu 24.04) with the pinned toolchain, LLVM 17.0.6
 (`clang-17`, `opt-17`), Python 3.13, 2 CPU cores. Phase 1 took 90 s and
 Phase 3 took 705 s.
 
-**a. Phase 1-7 Outputs:**
-Phase 1-4 data outputs were created on 2026-10-08 in a **full run** at git commit `f401926`.
-Phase 5-8 outputs were attempted on 2026-10-08 using `--smoke`, but were stopped (see e).
+| Item | Value |
+|---|---|
+| C files found (PolyBench + MiBench) | 1118 |
+| Files compiled | 496 (PolyBench 30 of 31, MiBench 466 of 1087) |
+| Files that failed | 622, each listed with its reason in `results/compile_failures.csv` |
+| Functions with at least 10 instructions | 2703 |
+| Duplicate function bodies removed | 93 |
+| Cap per benchmark program | 100 |
+| Benchmark programs (CV groups) | 53 (30 PolyBench, 23 MiBench) |
+| **Unique functions** | **1038** |
+| **States (samples)** | **2953** (1038 baseline + 1915 prefix states) |
+| Label rows (state x pass) | 53,154 |
+| Failed `opt` calls | 0 |
+| Features per state | 40 |
 
-**b. Statistics:**
-Files compiled: 496
-Files failed: 622
-Groups (Benchmark programs): 53
-Unique functions: 1038
-Total samples (States): 2953
-Per-pass decreased / equal / increased counts are preserved in `results/phase3_gate.txt`. For instance:
-- `instcombine`: decr=2148, equal=794, incr=11
-- `simplifycfg`: decr=2083, equal=859, incr=11
-- `early-cse`: decr=2035, equal=918, incr=0
-- `licm`: decr=102, equal=2126, incr=725
-- (See full table in phase3_gate.txt)
+Checks that passed (`results/instcount_validation.txt`,
+`results/phase3_verification.txt`):
 
-**c. Kept/Interpreted pass x target pairs & PR-AUC:**
-Interpretable passes: `instcombine, simplifycfg, early-cse, gvn, adce, reassociate, jump-threading, correlated-propagation, licm, loop-rotate, indvars, loop-deletion, tailcallelim`.
-Target status kept:
-- `instcombine` (beneficial, fired)
-- `simplifycfg` (beneficial, fired)
-- `early-cse` (beneficial, fired)
-- `gvn` (beneficial, fired)
-- `sccp` (fired)
-- `adce` (fired)
-- `reassociate` (beneficial, harmful, fired)
-- `jump-threading` (beneficial, fired)
-- `correlated-propagation` (beneficial, fired)
-- `licm` (beneficial, harmful, fired)
-- `loop-rotate` (beneficial, harmful, fired)
-- `indvars` (beneficial, harmful, fired)
-- `loop-deletion` (fired)
-- `loop-idiom` (harmful, fired)
-- `loop-unroll` (harmful, fired)
-- `tailcallelim` (fired)
+- The IR parser's instruction and block counts equal LLVM's own
+  (`print<func-properties>`) on all 3578 compiled functions, and on 400
+  randomly chosen pass outputs.
+- 50 of 50 randomly chosen label rows are identical when recomputed.
+- State hashes are unique, and no hash or function appears in two programs.
+- 31 unit tests pass; expected values are worked out by hand in the test file.
 
-PR-AUC for XGBoost vs Majority Baseline (for interpretable kept pairs, from random_forest/logistic_regression omitted here to highlight XGBoost vs Baseline):
-- `instcombine/beneficial`: XGB=0.8344 vs BL=0.7076
-- `instcombine/fired`: XGB=0.9292 vs BL=0.8995
-- `simplifycfg/beneficial`: XGB=0.9031 vs BL=0.6886
-- `simplifycfg/fired`: XGB=0.9328 vs BL=0.7390
-- `early-cse/beneficial`: XGB=0.8495 vs BL=0.6896
-- `early-cse/fired`: XGB=0.8567 vs BL=0.6976
-- `gvn/beneficial`: XGB=0.8100 vs BL=0.7498
-- `gvn/fired`: XGB=0.8376 vs BL=0.7816
-- `adce/fired`: XGB=0.3793 vs BL=0.1023
-- `reassociate/beneficial`: XGB=0.0731 vs BL=0.0785
-- `reassociate/harmful`: XGB=0.0895 vs BL=0.0460
-- `reassociate/fired`: XGB=0.6963 vs BL=0.4222
-- `jump-threading/beneficial`: XGB=0.8464 vs BL=0.6246
-- `jump-threading/fired`: XGB=0.8683 vs BL=0.6638
-- `correlated-propagation/beneficial`: XGB=0.1756 vs BL=0.1367
-- `correlated-propagation/fired`: XGB=0.7921 vs BL=0.6543
-- `licm/beneficial`: XGB=0.0947 vs BL=0.0422
-- `licm/harmful`: XGB=0.0281 vs BL=0.0221
-- `licm/fired`: XGB=0.6495 vs BL=0.3821
-- `loop-rotate/beneficial`: XGB=0.1266 vs BL=0.0882
-- `loop-rotate/harmful`: XGB=0.6847 vs BL=0.4189
-- `loop-rotate/fired`: XGB=0.8281 vs BL=0.5319
-- `indvars/beneficial`: XGB=0.3048 vs BL=0.1598
-- `indvars/harmful`: XGB=0.1916 vs BL=0.0936
-- `indvars/fired`: XGB=0.6400 vs BL=0.3980
-- `loop-deletion/fired`: XGB=0.0264 vs BL=0.0062
-- `tailcallelim/fired`: XGB=0.8073 vs BL=0.6413
-
-**d. Audits:**
-`leakage_audit.txt`: Contains only the header `# Leakage Audit` (no leakage found).
-`skipped_folds.txt`: Contains only the header `# Skipped Folds` (no folds skipped).
-`heuristics.yaml` SHA-256 matches exactly with `env.json` (`354269c617ba8fff226129b806cc66d82564cfede247660304dc5f19c0e7677c`).
-
-**e. Phase 8:**
-Phase 8 did not complete (Phase 5-8 execution was manually aborted as they were hanging in `size_confound_analysis` during loop evaluations even in `--smoke` mode, exceeding acceptable wait limits). Thus, Phase 5-8 are **NOT RUN**.
+The per-pass table is in `results/phase3_gate.txt`.
 
 ### Models and explanations (Phases 4-8): NOT run on this data
 
@@ -133,3 +86,13 @@ passes should be defined against `inst_control`; this must be written into
 - Remove the three LLVM source files from the repository root
   (`JumpThreading.cpp`, `LoopRotation.cpp`, `LoopUnrollPass.cpp`); cite the
   file, option name and release tag in `heuristics.yaml` instead.
+
+## Phase 4 attempt on 2026-10-09 (withdrawn)
+A Phase 4 run was pushed and then withdrawn. It did not follow
+ANALYSIS_PLAN.md: it used one split (train on 289 PolyBench samples,
+test on 2664 MiBench samples) instead of repeated grouped
+cross-validation, the 15 values given to the Wilcoxon test were
+bootstrap resamples of that one test set, the 5%-95% keep rule was
+removed, and the leakage audit was not run. Its outputs were deleted
+and must not be cited. scripts/phase4_models.py to phase7_sequence.py
+do not yet implement the plan.
