@@ -1,484 +1,362 @@
 #!/usr/bin/env python3
 """
-phase7_sequence.py — Sequence-level pass ordering evaluation.
+phase7_sequence.py — Do the per-pass models add up to a useful pass sequence?
 
-Greedy selector:
-  1. Extract features from the current IR state.
-  2. Apply the pass with the highest predicted probability of being beneficial.
-  3. Repeat up to 8 steps or until no pass exceeds probability 0.5.
-  4. Compare final instruction count with:
-     - -Oz (LLVM size-optimized)
-     - -O2 (LLVM default optimization)
-     - A random sequence of equal length
-     - Oracle greedy (try all passes, pick the one that actually reduces most)
-  5. Evaluate on held-out programs only.
+  1. Hold out 20 % of the benchmark programs (seeded sample, taken within
+     each suite).  Their functions are never used for training here.
+  2. Train one XGBoost model per pass on the OTHER programs, for the
+     "beneficial" target, using the hyperparameters Phase 4 chose most often.
+     Only passes whose model beat the majority baseline are used.
+  3. For every held-out function build pass sequences in five ways and
+     compare the final instruction count with the starting count:
+        model     apply the pass with the highest predicted probability,
+                  repeat (up to 8 steps, stop when nothing is above 0.5)
+        oracle    try every pass, apply the one that shrinks the code most
+                  (an upper bound for any greedy choice of single passes)
+        random    random passes, same length as the model's sequence
+        -Oz, -O2  LLVM's standard pipelines
+  4. Report the geometric mean size ratio per method, with programs as the
+     unit and a bootstrap confidence interval over programs.
+
+The objective is code size (instruction count), not running time.
 
 Output:
-  results/phase7_sequence.csv     — per-program sequence results
-  results/phase7_summary.csv      — aggregate comparison
-  results/figures/sequence_*.png  — comparison plots
+  results/phase7_sequence.csv   one row per held-out function and method
+  results/phase7_program.csv    geometric mean per program and method
+  results/phase7_summary.csv    overall geometric mean with CI
+  results/phase7_holdout.txt    held-out programs and the leakage check
+  results/figures/sequence/sequence_summary.png
+  results/phase7_gate.txt
 
 Usage:
-  python -m scripts.phase7_sequence [--smoke]
+  python -m scripts.phase7_sequence [--smoke] [--jobs N]
 """
 
 import argparse
-import json
-import os
-import random
-import subprocess
 import sys
-import tempfile
-import warnings
+import time
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.utils import (
-    PROJECT_ROOT, DATA_DIR, IR_DIR, FEATURES_DIR, LABELS_DIR,
-    RESULTS_DIR, FIGURES_DIR, CACHE_DIR,
-    ensure_dirs, find_llvm_tools, run_tool,
-    count_instructions, read_ir_file, write_ir_file,
-    setup_logging, PASS_LIST,
+from scripts.analysis_common import (
+    DiskGuard, Settings, build_pair_data, get_settings, load_dataset, load_tuned_params,
+    make_xgb, pair_key, percentile_ci, read_master_table, safe_n_jobs,
 )
 from scripts.phase2_features import extract_features_from_ir_text
-from scripts.phase3_labels import apply_pass
+from scripts.phase3_labels import PASS_PIPELINES, run_pipeline
+from scripts.utils import (
+    DATA_DIR, FIGURES_DIR, PASS_LIST, PROJECT_ROOT, RESULTS_DIR, count_instructions,
+    ensure_dirs, find_llvm_tools, hash_ir, read_ir_file, require_pinned_llvm, setup_logging,
+)
 
 log = setup_logging("phase7")
-warnings.filterwarnings("ignore", category=FutureWarning)
 
-MAX_STEPS = 8
-PROB_THRESHOLD = 0.5
-RANDOM_SEED = 42
-
-
-# ============================================================================
-# Load trained models
-# ============================================================================
-
-def load_models(models_dir: Path, passes: list) -> dict:
-    """Load saved XGBoost models for each pass (using the 'beneficial' target)."""
-    import pickle
-    models = {}
-    for pass_name in passes:
-        model_path = models_dir / f"xgb_{pass_name}_beneficial.pkl"
-        if model_path.exists():
-            with open(model_path, "rb") as f:
-                models[pass_name] = pickle.load(f)
-        else:
-            log.warning("No model found for pass %s", pass_name)
-    return models
+METHODS = ["model", "oracle", "random", "Oz", "O2"]
+METHOD_LABELS = {"model": "model-guided (ours)", "oracle": "oracle greedy",
+                 "random": "random passes", "Oz": "LLVM -Oz", "O2": "LLVM -O2"}
+STANDARD_PIPELINES = {"Oz": "default<Oz>", "O2": "default<O2>"}
+PROBABILITY_THRESHOLD = 0.5
 
 
 # ============================================================================
-# Greedy selector
+# Hold-out and training
 # ============================================================================
 
-def greedy_sequence(ir_text: str, models: dict, feature_cols: list,
-                     tools: dict, func_name: str = "unknown") -> dict:
+def choose_holdout_programs(index: pd.DataFrame, cfg: Settings) -> List[str]:
+    """A seeded sample of programs, drawn separately inside each suite."""
+    rng = np.random.RandomState(cfg.base_seed)
+    held_out = []
+    for suite, group in index.groupby("suite", sort=True):
+        programs = sorted(group["program"].unique())
+        n_pick = max(1, int(round(cfg.sequence_holdout_fraction * len(programs))))
+        held_out.extend(rng.choice(programs, size=n_pick, replace=False).tolist())
+    return sorted(held_out)
+
+
+def train_models(held_out: List[str], master: pd.DataFrame, cfg: Settings) -> Tuple[dict, list, list]:
     """
-    Greedily apply passes using model predictions.
-    Returns dict with sequence info and final instruction count.
+    One 'beneficial' model per usable pass, trained on programs that are NOT
+    held out.  Returns (models, feature_names, audit_lines).
     """
-    current_ir = ir_text
+    features, labels = load_dataset()
+    tuned_file = load_tuned_params()
+    feature_names = tuned_file["feature_names"]
+    usable = master[(master["target"] == "beneficial")
+                    & (master["model_status"] == "beats majority")]["pass_name"].tolist()
+    models, audit = {}, []
+    for pass_name in usable:
+        data = build_pair_data(features, labels, pass_name, "beneficial", feature_names=feature_names)
+        train = ~np.isin(data.groups, held_out)
+        overlap = len(set(data.groups[train]) & set(held_out))
+        audit.append(f"{'PASS' if overlap == 0 else 'FAIL'} {pass_name} beneficial "
+                     f"n_train={int(train.sum())} train_programs={len(set(data.groups[train]))} "
+                     f"program_overlap_with_holdout={overlap}")
+        if overlap:
+            raise RuntimeError(f"Held-out programs leaked into the training set of {pass_name}.")
+        if len(np.unique(data.y[train])) < 2:
+            audit.append(f"SKIP {pass_name}: training rows have a single class")
+            continue
+        params = tuned_file["pairs"][pair_key(pass_name, "beneficial")]["modal_params"]
+        model = make_xgb(params, data.y[train], cfg.base_seed)
+        model.fit(data.X[train], data.y[train])
+        models[pass_name] = model
+    return models, feature_names, audit
+
+
+# ============================================================================
+# Sequences for one function
+# ============================================================================
+
+def apply_pass_checked(ir_text: str, pass_name: str, tools: dict, func_name: str) -> Optional[str]:
+    """Apply a pass; return the new IR, or None if opt failed or nothing changed."""
+    output, _ = run_pipeline(ir_text, PASS_PIPELINES[pass_name], tools)
+    if output is None or hash_ir(output, func_name) == hash_ir(ir_text, func_name):
+        return None
+    return output
+
+
+def model_sequence(ir_text, func_name, models, feature_names, tools, cfg) -> Tuple[str, List[str]]:
+    """Greedy sequence guided by the models' predicted probabilities."""
     sequence = []
-    inst_counts = [count_instructions(current_ir)]
-
-    for step in range(MAX_STEPS):
-        # Extract features from current state
-        # Write to temp file for loop analysis
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".ll", delete=False,
-                                          dir=str(CACHE_DIR)) as tmp:
-            tmp.write(current_ir)
-            tmp_path = Path(tmp.name)
-
-        try:
-            features = extract_features_from_ir_text(
-                current_ir, tools, ll_file=tmp_path, func_name=func_name
-            )
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        if not features:
+    for _ in range(cfg.sequence_max_steps):
+        feats = extract_features_from_ir_text(ir_text, tools, func_name=func_name)
+        if not feats:
             break
-
-        # Build feature vector in the same order as training
-        feat_vector = np.array(
-            [features.get(col, 0.0) for col in feature_cols],
-            dtype=np.float32,
-        ).reshape(1, -1)
-        feat_vector = np.nan_to_num(feat_vector, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Predict probability for each pass
-        best_pass = None
-        best_prob = 0.0
-
-        for pass_name, model in models.items():
-            prob = model.predict_proba(feat_vector)[0, 1]
-            if prob > best_prob:
-                best_prob = prob
-                best_pass = pass_name
-
-        # Stop if no pass exceeds threshold
-        if best_pass is None or best_prob < PROB_THRESHOLD:
+        row = np.array([[feats[name] for name in feature_names]], dtype=np.float32)
+        ranked = sorted(((float(model.predict_proba(row)[0, 1]), pass_name)
+                         for pass_name, model in models.items()), reverse=True)
+        applied = False
+        for probability, pass_name in ranked:
+            if probability < PROBABILITY_THRESHOLD:
+                break
+            output = apply_pass_checked(ir_text, pass_name, tools, func_name)
+            if output is not None:           # the pass really changed the IR
+                ir_text = output
+                sequence.append(pass_name)
+                applied = True
+                break
+        if not applied:
             break
-
-        # Apply the best pass
-        result_ir = apply_pass(current_ir, best_pass, tools)
-        if result_ir is None:
-            break
-
-        new_count = count_instructions(result_ir)
-        current_ir = result_ir
-        sequence.append(best_pass)
-        inst_counts.append(new_count)
-
-        # Stop if no reduction
-        if new_count >= inst_counts[-2]:
-            break
-
-    return {
-        "sequence": sequence,
-        "inst_counts": inst_counts,
-        "initial_count": inst_counts[0],
-        "final_count": inst_counts[-1],
-        "n_steps": len(sequence),
-    }
+    return ir_text, sequence
 
 
-# ============================================================================
-# Baseline sequences
-# ============================================================================
-
-def apply_opt_level(ir_text: str, level: str, tools: dict) -> int:
-    """Apply -Oz or -O2 and return final instruction count."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ll", delete=False,
-                                      dir=str(CACHE_DIR)) as tmp:
-        tmp.write(ir_text)
-        tmp_path = tmp.name
-
-    try:
-        out_path = tmp_path + f".{level}.ll"
-        cmd = [tools["opt"], f"-{level}", "-S", "-o", out_path, tmp_path]
-        result = run_tool(cmd, timeout=30, check=False)
-
-        if result.returncode != 0 or not os.path.exists(out_path):
-            return count_instructions(ir_text)
-
-        output_ir = Path(out_path).read_text(encoding="utf-8", errors="replace")
-        return count_instructions(output_ir)
-    finally:
-        for p in [tmp_path, tmp_path + f".{level}.ll"]:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-
-def random_sequence(ir_text: str, length: int, tools: dict, seed: int) -> dict:
-    """Apply a random sequence of passes."""
-    rng = random.Random(seed)
-    current_ir = ir_text
+def oracle_sequence(ir_text, func_name, tools, cfg) -> Tuple[str, List[str]]:
+    """Greedy sequence that looks at the true result of every pass first."""
     sequence = []
-    inst_counts = [count_instructions(current_ir)]
-
-    for _ in range(length):
-        pass_name = rng.choice(PASS_LIST)
-        result_ir = apply_pass(current_ir, pass_name, tools)
-        if result_ir is None:
-            break
-        current_ir = result_ir
-        sequence.append(pass_name)
-        inst_counts.append(count_instructions(current_ir))
-
-    return {
-        "sequence": sequence,
-        "inst_counts": inst_counts,
-        "initial_count": inst_counts[0],
-        "final_count": inst_counts[-1],
-    }
-
-
-def oracle_greedy_sequence(ir_text: str, tools: dict, max_steps: int = 8) -> dict:
-    """
-    Oracle greedy: at each step, try ALL passes and pick the one
-    that actually reduces instruction count the most.
-    """
-    current_ir = ir_text
-    sequence = []
-    inst_counts = [count_instructions(current_ir)]
-
-    for _ in range(max_steps):
-        best_pass = None
-        best_count = inst_counts[-1]
-        best_ir = None
-
+    for _ in range(cfg.sequence_max_steps):
+        current = count_instructions(ir_text)
+        best_count, best_ir, best_pass = current, None, None
         for pass_name in PASS_LIST:
-            result_ir = apply_pass(current_ir, pass_name, tools)
-            if result_ir is None:
+            output, _ = run_pipeline(ir_text, PASS_PIPELINES[pass_name], tools)
+            if output is None:
                 continue
-            new_count = count_instructions(result_ir)
-            if new_count < best_count:
-                best_count = new_count
-                best_pass = pass_name
-                best_ir = result_ir
-
-        if best_pass is None or best_count >= inst_counts[-1]:
+            size = count_instructions(output)
+            if size < best_count:
+                best_count, best_ir, best_pass = size, output, pass_name
+        if best_ir is None:
             break
-
-        current_ir = best_ir
+        ir_text = best_ir
         sequence.append(best_pass)
-        inst_counts.append(best_count)
+    return ir_text, sequence
 
-    return {
-        "sequence": sequence,
-        "inst_counts": inst_counts,
-        "initial_count": inst_counts[0],
-        "final_count": inst_counts[-1],
-    }
+
+def evaluate_function(func_info: dict, models: dict, feature_names: list, tools: dict,
+                      cfg: Settings) -> List[dict]:
+    """All five methods on one held-out function."""
+    func_name = func_info["function"]
+    start_ir = read_ir_file(PROJECT_ROOT / func_info["path"])
+    start_count = count_instructions(start_ir)
+    base = {"func_id": func_info["func_id"], "suite": func_info["suite"],
+            "program": func_info["program"], "inst_start": start_count}
+    rows = []
+
+    def add(method: str, final_count: Optional[int], sequence: str, note: str = ""):
+        rows.append({**base, "method": method, "inst_final": final_count,
+                     "size_ratio": None if final_count is None else final_count / start_count,
+                     "sequence": sequence, "note": note})
+
+    final_ir, sequence = model_sequence(start_ir, func_name, models, feature_names, tools, cfg)
+    add("model", count_instructions(final_ir), ";".join(sequence))
+    model_length = len(sequence)
+
+    final_ir, sequence = oracle_sequence(start_ir, func_name, tools, cfg)
+    add("oracle", count_instructions(final_ir), ";".join(sequence))
+
+    # Random sequences of the same length as the model's (average of several)
+    rng = np.random.RandomState(int(func_info["ir_hash"][:8], 16) % (2 ** 31))
+    ratios = []
+    for _ in range(cfg.n_random_draws):
+        ir_text = start_ir
+        for pass_name in rng.choice(PASS_LIST, size=model_length):
+            output, _ = run_pipeline(ir_text, PASS_PIPELINES[pass_name], tools)
+            if output is not None:
+                ir_text = output
+        ratios.append(count_instructions(ir_text) / start_count)
+    mean_ratio = float(np.mean(ratios)) if ratios else 1.0
+    rows.append({**base, "method": "random", "inst_final": round(mean_ratio * start_count, 2),
+                 "size_ratio": mean_ratio, "sequence": f"{model_length} random passes",
+                 "note": f"mean of {cfg.n_random_draws} draws"})
+
+    for method, pipeline in STANDARD_PIPELINES.items():
+        output, reason = run_pipeline(start_ir, pipeline, tools)
+        if output is None:
+            add(method, None, pipeline, note=reason)      # recorded, not guessed
+        else:
+            add(method, count_instructions(output), pipeline)
+    return rows
 
 
 # ============================================================================
-# Main pipeline
+# Aggregation
 # ============================================================================
 
-def run_phase7(smoke: bool = False):
-    """Execute Phase 7: sequence-level evaluation."""
+def geometric_mean(values) -> float:
+    values = np.asarray(values, dtype=float)
+    return float(np.exp(np.mean(np.log(values)))) if len(values) else float("nan")
+
+
+def summarise(detail: pd.DataFrame, cfg: Settings) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Geometric mean size ratio per program, then over programs.
+    A ratio of 0 cannot go into a geometric mean, so an (unusual) function
+    reduced to nothing is counted as 1 instruction.
+    """
+    ok = detail.dropna(subset=["size_ratio"]).copy()
+    ok["size_ratio"] = ok["size_ratio"].clip(lower=1.0 / ok["inst_start"])
+    per_program = ok.groupby(["suite", "program", "method"], sort=False)["size_ratio"].agg(
+        geo_mean_ratio=geometric_mean, n_functions="size").reset_index()
+
+    wide = per_program.pivot(index="program", columns="method", values="geo_mean_ratio")
+    programs = wide.index.to_numpy()
+    rng = np.random.RandomState(cfg.base_seed)
+    draws = rng.randint(len(programs), size=(cfg.n_bootstrap, len(programs)))
+    rows = []
+    for method in METHODS:
+        if method not in wide:
+            continue
+        log_ratio = np.log(wide[method].to_numpy())
+        boot = np.exp(np.nanmean(log_ratio[draws], axis=1))
+        low, high = percentile_ci(boot, cfg.alpha)
+        row = {"method": method, "n_programs": int(np.sum(~np.isnan(log_ratio))),
+               "geo_mean_ratio": round(float(np.exp(np.nanmean(log_ratio))), 4),
+               "ci_low": round(low, 4), "ci_high": round(high, 4),
+               "model_vs_method_ratio": None, "model_vs_method_ci_low": None,
+               "model_vs_method_ci_high": None}
+        if method != "model" and "model" in wide:
+            # Paired comparison on the same programs: below 1 = the model's
+            # sequences end smaller than this method's
+            difference = np.log(wide["model"].to_numpy()) - log_ratio
+            boot = np.exp(np.nanmean(difference[draws], axis=1))
+            low, high = percentile_ci(boot, cfg.alpha)
+            row.update({"model_vs_method_ratio": round(float(np.exp(np.nanmean(difference))), 4),
+                        "model_vs_method_ci_low": round(low, 4),
+                        "model_vs_method_ci_high": round(high, 4)})
+        rows.append(row)
+    return per_program, pd.DataFrame(rows)
+
+
+def make_figure(summary: pd.DataFrame):
+    """Geometric mean size ratio per method with its confidence interval."""
+    from scripts.plot_style import INK, INK_MUTED, SERIES_COLORS, save_figure, use_style
+    plt = use_style()
+    fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    order = summary.sort_values("geo_mean_ratio", ascending=False).reset_index(drop=True)
+    for position, row in order.iterrows():
+        ax.plot([row["ci_low"], row["ci_high"]], [position, position],
+                color=SERIES_COLORS[0], linewidth=2)
+        ax.plot(row["geo_mean_ratio"], position, marker="o", color=SERIES_COLORS[0])
+        ax.annotate(f"{row['geo_mean_ratio']:.2f}", xy=(row["geo_mean_ratio"], position),
+                    xytext=(0, 9), textcoords="offset points", ha="center",
+                    fontsize=9, color=INK)
+    ax.axvline(1.0, color=INK_MUTED, linewidth=0.8)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels([METHOD_LABELS[m] for m in order["method"]])
+    ax.set_ylim(-0.6, len(order) - 0.4)
+    ax.set_xlabel("final size / starting size (geometric mean over programs, lower is smaller)")
+    ax.set_title("Code size after each kind of pass sequence, held-out programs")
+    ax.grid(axis="y", visible=False)
+    save_figure(fig, FIGURES_DIR / "sequence" / "sequence_summary.png")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def run_phase7(smoke: bool = False, n_jobs: int = 2):
+    """Execute Phase 7."""
     ensure_dirs()
-    import pandas as pd
-
+    cfg = get_settings(smoke)
+    guard = DiskGuard()
+    start = time.time()
     tools = find_llvm_tools()
+    require_pinned_llvm(tools)
 
-    # Load function index (held-out programs only — use test fold from phase 4)
-    index_path = DATA_DIR / "function_index.csv"
-    if not index_path.exists():
-        log.error("Function index not found — run Phase 1 first.")
-        sys.exit(1)
+    master = read_master_table()
+    index = pd.read_csv(DATA_DIR / "function_index.csv")
+    held_out = choose_holdout_programs(index, cfg)
+    models, feature_names, audit = train_models(held_out, master, cfg)
 
-    df_index = pd.read_csv(index_path)
-    df_index = df_index[df_index["is_duplicate"] == False].copy()
+    functions = index[index["program"].isin(held_out)]
+    if len(functions) > cfg.sequence_max_functions:
+        functions = functions.sample(n=cfg.sequence_max_functions, random_state=cfg.base_seed)
+    functions = functions.sort_values("func_id").to_dict("records")
 
-    df_held_out = df_index[df_index["suite"] == "mibench"]
-    held_out_programs = df_held_out["program"].unique()
-
-    if smoke:
-        df_held_out = df_held_out.head(5)
-
-    log.info("Phase 7: evaluating on %d held-out functions from %d programs",
-             len(df_held_out), len(held_out_programs))
-
-    # Load models
-    models_dir = DATA_DIR / "models"
-    interp_path = LABELS_DIR / "interpretable_passes.json"
-    if interp_path.exists():
-        with open(interp_path) as f:
-            interp_passes = json.load(f)
-    else:
-        interp_passes = PASS_LIST
-
-    models = load_models(models_dir, interp_passes)
+    (RESULTS_DIR / "phase7_holdout.txt").write_text(
+        "# Held-out programs (never used to train the Phase 7 models)\n"
+        + "\n".join(held_out) + "\n\n# Training-set check, one line per model\n"
+        + "\n".join(audit) + "\n", encoding="utf-8")
+    log.info("Held-out programs: %d | functions evaluated: %d | models: %s",
+             len(held_out), len(functions), sorted(models))
     if not models:
-        log.error("No models found — run Phase 4 first.")
-        sys.exit(1)
+        report = ("PHASE 7 GATE REPORT\n" + "=" * 70 + "\nNo 'beneficial' model beat the "
+                  "majority baseline, so there is no model to guide a sequence. NOT RUN.\n")
+        (RESULTS_DIR / "phase7_gate.txt").write_text(report, encoding="utf-8")
+        log.warning(report)
+        return
 
-    # Load feature columns
-    feature_cols_path = FEATURES_DIR / "feature_columns.json"
-    if feature_cols_path.exists():
-        with open(feature_cols_path) as f:
-            feature_cols = json.load(f)
-    else:
-        log.error("Feature columns not found — run Phase 4 first.")
-        sys.exit(1)
+    # Threads, not processes: the time goes into `opt` subprocesses, and the
+    # trained models are shared instead of being copied to every worker.
+    from joblib import Parallel, delayed
+    jobs = safe_n_jobs(n_jobs)
+    results = Parallel(n_jobs=jobs, prefer="threads")(
+        delayed(evaluate_function)(f, models, feature_names, tools, cfg) for f in functions)
+    guard.check()
 
-    # Evaluate each held-out function
-    results = []
+    detail = pd.DataFrame([row for rows in results for row in rows])
+    detail.to_csv(RESULTS_DIR / "phase7_sequence.csv", index=False)
+    per_program, summary = summarise(detail, cfg)
+    per_program.round(4).to_csv(RESULTS_DIR / "phase7_program.csv", index=False)
+    summary.to_csv(RESULTS_DIR / "phase7_summary.csv", index=False)
+    if len(summary):
+        make_figure(summary)
 
-    for idx, row in df_held_out.iterrows():
-        ll_path = PROJECT_ROOT / row["path"]
-        if not ll_path.exists():
-            continue
-
-        ir_text = read_ir_file(ll_path)
-        func_name = row["function"]
-        program = row["program"]
-        suite = row["suite"]
-        initial_count = count_instructions(ir_text)
-
-        if initial_count < 10:
-            continue
-
-        log.info("  Evaluating %s/%s (initial: %d inst)", program, func_name, initial_count)
-
-        # 1. Greedy selector
-        greedy = greedy_sequence(ir_text, models, feature_cols, tools, func_name)
-
-        # 2. -Oz
-        oz_count = apply_opt_level(ir_text, "Oz", tools)
-
-        # 3. -O2
-        o2_count = apply_opt_level(ir_text, "O2", tools)
-
-        # 4. Random sequence (same length as greedy)
-        rand_result = random_sequence(ir_text, greedy["n_steps"], tools, RANDOM_SEED)
-
-        # 5. Oracle greedy
-        oracle = oracle_greedy_sequence(ir_text, tools, MAX_STEPS)
-
-        results.append({
-            "suite": suite,
-            "program": program,
-            "function": func_name,
-            "initial_count": initial_count,
-            "greedy_count": greedy["final_count"],
-            "greedy_steps": greedy["n_steps"],
-            "greedy_sequence": ";".join(greedy["sequence"]),
-            "oz_count": oz_count,
-            "o2_count": o2_count,
-            "random_count": rand_result["final_count"],
-            "random_steps": len(rand_result["sequence"]),
-            "oracle_count": oracle["final_count"],
-            "oracle_steps": len(oracle["sequence"]),
-            "oracle_sequence": ";".join(oracle["sequence"]),
-            # Relative reductions from initial
-            "greedy_reduction": round((initial_count - greedy["final_count"]) / initial_count, 4),
-            "oz_reduction": round((initial_count - oz_count) / initial_count, 4),
-            "o2_reduction": round((initial_count - o2_count) / initial_count, 4),
-            "random_reduction": round((initial_count - rand_result["final_count"]) / initial_count, 4),
-            "oracle_reduction": round((initial_count - oracle["final_count"]) / initial_count, 4),
-        })
-
-    if not results:
-        log.error("No sequence results generated!")
-        sys.exit(1)
-
-    # Save results
-    df_results = pd.DataFrame(results)
-    df_results.to_csv(RESULTS_DIR / "phase7_sequence.csv", index=False)
-    log.info("Sequence results saved to %s", RESULTS_DIR / "phase7_sequence.csv")
-
-    # ---- Geometric mean size ratio with bootstrap CIs ----
-    def geomean_ratio(method_counts, initial_counts):
-        """Geometric mean of (method_count / initial_count) across programs."""
-        ratios = method_counts / np.maximum(initial_counts, 1)
-        ratios = ratios[ratios > 0]
-        if len(ratios) == 0:
-            return 1.0
-        return float(np.exp(np.mean(np.log(ratios))))
-
-    def bootstrap_geomean_ci(method_col, initial_col, programs, n_boot=10000, alpha=0.05):
-        """Bootstrap CI for geometric mean size ratio, resampling programs."""
-        rng = np.random.RandomState(42)
-        unique_progs = np.unique(programs)
-        boot_means = []
-        for _ in range(n_boot):
-            boot_progs = rng.choice(unique_progs, len(unique_progs), replace=True)
-            boot_method = []
-            boot_init = []
-            for p in boot_progs:
-                mask = programs == p
-                boot_method.extend(method_col[mask])
-                boot_init.extend(initial_col[mask])
-            boot_method = np.array(boot_method)
-            boot_init = np.array(boot_init)
-            boot_means.append(geomean_ratio(boot_method, boot_init))
-        boot_means = np.array(boot_means)
-        return (float(np.percentile(boot_means, 100 * alpha / 2)),
-                float(np.percentile(boot_means, 100 * (1 - alpha / 2))))
-
-    programs_arr = df_results["program"].values
-    initial_arr = df_results["initial_count"].values.astype(float)
-
-    summary_rows = []
-    for method, col in [("greedy", "greedy_count"), ("Oz", "oz_count"),
-                         ("O2", "o2_count"), ("random", "random_count"),
-                         ("oracle", "oracle_count")]:
-        method_arr = df_results[col].values.astype(float)
-        gm = geomean_ratio(method_arr, initial_arr)
-        ci_lo, ci_hi = bootstrap_geomean_ci(method_arr, initial_arr, programs_arr)
-        summary_rows.append({
-            "method": method,
-            "geomean_size_ratio": round(gm, 4),
-            "ci_lo": round(ci_lo, 4),
-            "ci_hi": round(ci_hi, 4),
-            "mean_reduction": round(float(df_results[col.replace("_count", "_reduction")].mean()), 4),
-        })
-
-    df_summary = pd.DataFrame(summary_rows)
-    df_summary.to_csv(RESULTS_DIR / "phase7_summary.csv", index=False)
-    log.info("Summary:\n%s", df_summary.to_string())
-
-    # ---- Plot comparison ----
-    seq_fig_dir = FIGURES_DIR / "sequence"
-    seq_fig_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    methods = df_summary["method"]
-    ratios = df_summary["geomean_size_ratio"]
-    ci_lo = df_summary["ci_lo"]
-    ci_hi = df_summary["ci_hi"]
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#9E9E9E", "#E91E63"]
-    bars = ax.bar(methods, ratios, color=colors, edgecolor="black", linewidth=0.5)
-    ax.errorbar(range(len(methods)), ratios,
-                yerr=[ratios - ci_lo, ci_hi - ratios],
-                fmt="none", color="black", capsize=5)
-    ax.set_ylabel("Geometric Mean Size Ratio (lower is better)")
-    ax.set_title("Sequence-Level Optimization — Geometric Mean Size Ratio")
-    ax.axhline(y=1.0, color="red", linestyle="--", alpha=0.5, label="No change")
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(seq_fig_dir / "sequence_comparison.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    data = [
-        df_results["greedy_reduction"] * 100,
-        df_results["oz_reduction"] * 100,
-        df_results["o2_reduction"] * 100,
-        df_results["random_reduction"] * 100,
-        df_results["oracle_reduction"] * 100,
-    ]
-    bp = ax.boxplot(data, tick_labels=["Greedy", "-Oz", "-O2", "Random", "Oracle"],
-                     patch_artist=True)
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.7)
-    ax.set_ylabel("Instruction Reduction (%)")
-    ax.set_title("Per-Function Instruction Reduction Distribution")
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(seq_fig_dir / "sequence_boxplot.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    # Gate report
-    report = f"""
-╔══════════════════════════════════════════════════════╗
-║              PHASE 7 GATE REPORT                     ║
-╠══════════════════════════════════════════════════════╣
-║ Held-out functions:     {len(results):>8}                     ║
-║ Greedy geomean ratio:   {df_summary[df_summary['method']=='greedy']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
-║ -Oz geomean ratio:      {df_summary[df_summary['method']=='Oz']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
-║ -O2 geomean ratio:      {df_summary[df_summary['method']=='O2']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
-║ Random geomean ratio:   {df_summary[df_summary['method']=='random']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
-║ Oracle geomean ratio:   {df_summary[df_summary['method']=='oracle']['geomean_size_ratio'].iloc[0]:>8.4f}                     ║
-╚══════════════════════════════════════════════════════╝
-"""
-    log.info(report)
-    (RESULTS_DIR / "phase7_gate.txt").write_text(report, encoding='utf-8')
+    failures = detail[detail["size_ratio"].isna()]
+    lines = ["PHASE 7 GATE REPORT", "=" * 70,
+             f"Settings:               {cfg.name}"
+             + ("   (SMOKE: these numbers are not results)" if smoke else ""),
+             f"Held-out programs:      {len(held_out)} of {index['program'].nunique()}",
+             f"Functions evaluated:    {len(functions)}",
+             f"Models used (passes):   {', '.join(sorted(models))}",
+             f"Failed pipeline runs:   {len(failures)}",
+             f"Run time this session:  {time.time() - start:.0f} s", "",
+             "Final size / starting size (geometric mean over programs; 1.00 = unchanged):",
+             summary.to_string(index=False)]
+    report = "\n".join(lines) + "\n"
+    (RESULTS_DIR / "phase7_gate.txt").write_text(report, encoding="utf-8")
+    log.info("\n%s", report)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 7: Sequence-level evaluation")
+    parser = argparse.ArgumentParser(description="Phase 7: sequence-level evaluation")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
-    run_phase7(smoke=args.smoke)
+    run_phase7(smoke=args.smoke, n_jobs=args.jobs)
 
 
 if __name__ == "__main__":

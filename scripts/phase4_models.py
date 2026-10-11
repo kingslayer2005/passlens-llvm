@@ -1,715 +1,483 @@
 #!/usr/bin/env python3
 """
-phase4_models.py — Train and evaluate XGBoost classifiers per pass.
+phase4_models.py — Can a model predict what a pass will do?
 
-Research upgrades (v2):
-  - Dual targets: beneficial and harmful per pass
-  - Repeated StratifiedGroupKFold (3 repeats x 5 folds), grouped by program
-  - Nested tuning: at most 10 random configs, 3 grouped inner folds
-  - scale_pos_weight for imbalance
-  - Bootstrap CI (resampling programs) for metrics
-  - Wilcoxon signed-rank test, Holm-corrected across passes
-  - Leakage audit (program and IR hash)
-  - Threshold sensitivity (relabel at 0.5%, 1%, 2%)
-  - Disk-space checks before each phase
+For every pass and each of the three targets (beneficial / harmful / fired):
 
-Output:
-  results/phase4_results.csv       — per-pass, per-fold, per-target metrics
-  results/phase4_summary.csv       — per-pass summary (mean + bootstrap CI)
-  results/phase4_wilcoxon.csv      — Wilcoxon signed-rank test results
-  results/leakage_audit.txt        — leakage audit
-  results/threshold_sensitivity.csv— label rates at each threshold
-  results/phase4_gate.txt          — gate report
-  data/models/                     — saved XGBoost models (one per pass per target)
+  1. Apply the keep rule: a target whose positive rate is outside 5 %-95 %
+     is dropped and nothing is fitted for it.
+  2. Evaluate four models with repeated, grouped, stratified cross-validation
+     (3 repeats x 5 folds, grouped by benchmark program, so a program is
+     never in both the training and the test fold):
+        majority baseline, logistic regression, random forest, XGBoost.
+     XGBoost hyperparameters are tuned inside each training fold (nested CV).
+  3. Write one audit line per fold proving that no program, function or IR
+     hash is on both sides.
+  4. Compare XGBoost with each baseline:
+        - Wilcoxon signed-rank test over the fold PR-AUCs, Holm-corrected
+          across targets
+        - bootstrap confidence interval of the PR-AUC difference, resampling
+          whole programs
+     A target "beats the majority baseline" only if BOTH agree.
+  5. Cross-suite check: train on one benchmark suite, test on the other.
+
+Output (all small text files):
+  results/master_table.csv            one row per pass x target, with status
+  results/phase4_results.csv          one row per pass, target, model, repeat, fold
+  results/phase4_summary.csv          mean / std / bootstrap CI per model
+  results/phase4_wilcoxon.csv         XGBoost vs each baseline
+  results/phase4_cross_suite.csv      train on one suite, test on the other
+  results/phase4_tuned_params.json    hyperparameters chosen in each fold
+  results/leakage_audit.txt           one line per fold
+  results/skipped_folds.txt           folds that could not be scored, with reason
+  results/phase4_gate.txt             gate report
 
 Usage:
-  python -m scripts.phase4_models [--smoke]
+  python -m scripts.phase4_models [--smoke] [--jobs N] [--only p1,p2] [--force]
 """
 
 import argparse
 import json
-import os
-import pickle
 import sys
-import warnings
+import time
+from collections import Counter
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.utils import (
-    PROJECT_ROOT, DATA_DIR, FEATURES_DIR, LABELS_DIR, RESULTS_DIR,
-    ensure_dirs, setup_logging, check_disk_space,
+from scripts.analysis_common import (
+    MASTER_TABLE, MODEL_NAMES, TUNED_PARAMS, DiskGuard, Settings,
+    build_pair_data, cache_dir, candidate_configs, feature_columns, fold_is_usable,
+    fold_key, get_settings, holm_correction, load_dataset, make_xgb, outer_splits,
+    pair_key, percentile_ci, pr_auc, program_bootstrap_indices, safe_n_jobs,
+    select_passes, target_table, tune_xgb, write_json_small,
 )
+from scripts.utils import RESULTS_DIR, ensure_dirs, setup_logging
 
 log = setup_logging("phase4")
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-N_REPEATS = 3
-N_OUTER_FOLDS = 5
-N_INNER_FOLDS = 3
-N_RANDOM_CONFIGS = 10
-N_BOOTSTRAP = 10000
-ALPHA = 0.05
-THRESHOLDS = [0.005, 0.01, 0.02]  # 0.5%, 1%, 2%
-
-METADATA_COLS = {"suite", "program", "function", "ir_hash", "state",
-                 "prefix_passes", "pass_name", "inst_before", "inst_after",
-                 "rel_reduction", "beneficial", "inst_count", "outcome",
-                 # columns added by the Phase 1-3 rewrite (never features)
-                 "func_id", "source_file", "compile_mode", "inst_control",
-                 "harmful", "fired", "changed_ir"}
-
-# XGBoost hyperparameter search space
-XGB_PARAM_SPACE = {
-    "n_estimators": [100, 200, 300],
-    "max_depth": [4, 6, 8],
-    "learning_rate": [0.05, 0.1, 0.2],
-    "subsample": [0.7, 0.8, 0.9],
-    "colsample_bytree": [0.7, 0.8, 0.9],
-}
-
-
-def get_feature_columns(df):
-    exclude = METADATA_COLS | {"max_loop_depth", "min_loop_header_size", "max_loop_header_size"}
-    return [c for c in df.columns if c not in exclude]
 
 
 # ============================================================================
-# Nested tuning
+# One (pass, target) pair — runs in a worker process
 # ============================================================================
 
-def nested_tune_xgboost(X_train, y_train, groups_train, rng):
+def evaluate_pair(pass_name: str, target: str, cfg: Settings) -> dict:
     """
-    Random search over XGB_PARAM_SPACE using N_INNER_FOLDS grouped CV.
-    Returns the best XGBClassifier (fitted on full X_train).
+    Cross-validate the four models on one (pass, target) pair.
+
+    The worker loads the two CSV files itself.  Nothing large is passed in
+    or returned: the result holds fold metrics, the chosen hyperparameters,
+    audit lines and the out-of-fold predictions (a few thousand numbers).
     """
-    from sklearn.metrics import average_precision_score
-    from sklearn.model_selection import StratifiedGroupKFold
-    from xgboost import XGBClassifier
-
-    n_pos = int(y_train.sum())
-    n_neg = len(y_train) - n_pos
-    spw = n_neg / max(n_pos, 1)
-
-    n_inner = min(N_INNER_FOLDS, len(set(groups_train)))
-    if n_inner < 2:
-        # Can't do inner CV; use defaults
-        model = XGBClassifier(
-            n_estimators=200, max_depth=6, learning_rate=0.1,
-            subsample=0.8, colsample_bytree=0.8,
-            scale_pos_weight=spw, random_state=42,
-            eval_metric="logloss",
-        )
-        model.fit(X_train, y_train)
-        return model
-
-    configs = []
-    for _ in range(N_RANDOM_CONFIGS):
-        cfg = {k: rng.choice(v) for k, v in XGB_PARAM_SPACE.items()}
-        configs.append(cfg)
-
-    best_score = -1
-    best_cfg = configs[0]
-
-    igkf = StratifiedGroupKFold(n_splits=n_inner)
-    for cfg in configs:
-        scores = []
-        for tr_idx, val_idx in igkf.split(X_train, y_train, groups_train):
-            if len(set(y_train[tr_idx])) < 2 or len(set(y_train[val_idx])) < 2:
-                continue
-            m = XGBClassifier(
-                **cfg, scale_pos_weight=spw,
-                random_state=42, eval_metric="logloss",
-            )
-            m.fit(X_train[tr_idx], y_train[tr_idx])
-            y_prob = m.predict_proba(X_train[val_idx])[:, 1]
-            scores.append(average_precision_score(y_train[val_idx], y_prob))
-        if scores and np.mean(scores) > best_score:
-            best_score = np.mean(scores)
-            best_cfg = cfg
-
-    model = XGBClassifier(
-        **best_cfg, scale_pos_weight=spw,
-        random_state=42, eval_metric="logloss",
-    )
-    model.fit(X_train, y_train)
-    return model
-
-
-# ============================================================================
-# Bootstrap CI
-# ============================================================================
-
-def bootstrap_ci_by_program(values, programs, n_bootstrap=N_BOOTSTRAP, alpha=0.05):
-    """
-    95% bootstrap CI resampling programs (cluster bootstrap).
-    values: array of per-sample values.
-    programs: array of program labels (same length).
-    Returns (mean, ci_low, ci_high).
-    """
-    rng = np.random.RandomState(42)
-    unique_programs = np.unique(programs)
-    n_prog = len(unique_programs)
-    if n_prog < 2:
-        m = float(np.mean(values))
-        return m, m, m
-
-    means = []
-    for _ in range(n_bootstrap):
-        sampled = rng.choice(unique_programs, size=n_prog, replace=True)
-        boot_vals = []
-        for p in sampled:
-            mask = programs == p
-            boot_vals.extend(values[mask])
-        if boot_vals:
-            means.append(np.mean(boot_vals))
-    means = np.array(means)
-    lo = float(np.percentile(means, 100 * alpha / 2))
-    hi = float(np.percentile(means, 100 * (1 - alpha / 2)))
-    return float(np.mean(values)), lo, hi
-
-
-# ============================================================================
-# Leakage audit
-# ============================================================================
-
-def leakage_audit(X, y, groups, ir_hashes, pass_name, target, n_repeats, n_folds, audit_file):
-    """
-    Assert no program and no IR hash appears in both train and test.
-    Writes results to audit_file (append mode).
-    Returns True if all folds pass.
-    """
-    from sklearn.model_selection import StratifiedGroupKFold
-
-    all_pass = True
-    n_splits = min(n_folds, len(set(groups)))
-    if n_splits < 2:
-        return True
-
-    for rep in range(n_repeats):
-        gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
-                                     random_state=42 + rep)
-        for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
-            train_programs = set(groups[train_idx])
-            test_programs = set(groups[test_idx])
-            prog_overlap = train_programs & test_programs
-
-            train_hashes = set(ir_hashes[train_idx])
-            test_hashes = set(ir_hashes[test_idx])
-            hash_overlap = train_hashes & test_hashes
-
-            ok = len(prog_overlap) == 0 and len(hash_overlap) == 0
-            if not ok:
-                all_pass = False
-
-            with open(audit_file, "a") as f:
-                f.write(f"pass={pass_name} target={target} rep={rep} fold={fold_idx} "
-                        f"prog_overlap={len(prog_overlap)} hash_overlap={len(hash_overlap)} "
-                        f"{'PASS' if ok else 'FAIL'}\n")
-    return all_pass
-
-
-# ============================================================================
-# Model training and evaluation
-# ============================================================================
-
-
-def train_and_evaluate_pass(pass_name, target_name, df_merged, feature_cols,
-                              save_dir, audit_file):
-    import pandas as pd
-    from sklearn.dummy import DummyClassifier
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import (
-        average_precision_score, f1_score, matthews_corrcoef,
-    )
-    from xgboost import XGBClassifier
-    from scripts.targets import build_target_labels
+    from sklearn.metrics import f1_score, matthews_corrcoef
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
 
-    pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-    y_series = build_target_labels(pass_df, pass_name, target_name)
-    y = y_series.values.astype(int)
+    start = time.time()
+    features, labels = load_dataset()
+    data = build_pair_data(features, labels, pass_name, target)
+    X, y, groups = data.X, data.y, data.groups
+    configs = candidate_configs(pass_name, target, cfg)
 
-    if len(pass_df) < 20:
-        return None, None, None
+    fold_rows = []       # one dict per model per usable fold
+    audit_lines = []     # one line per fold
+    skipped = []         # folds without both classes
+    tuned = {}           # fold key -> chosen hyperparameters
+    leak_found = False
 
-    X = pass_df[feature_cols].values.astype(np.float32)
-    groups = pass_df["program"].values
-    ir_hashes = pass_df["ir_hash"].values
-    suites = pass_df["suite"].values
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    # Out-of-fold predicted probabilities: [repeat][model] -> one value per
+    # sample (NaN where the sample's fold was skipped)
+    oof = np.full((cfg.n_repeats, len(MODEL_NAMES), len(y)), np.nan, dtype=np.float32)
 
-    # REMOVED drop rule
-    # if pos_rate < 0.05 or pos_rate > 0.95: ...
+    for repeat in range(cfg.n_repeats):
+        for fold, (train_idx, test_idx) in enumerate(outer_splits(y, groups, repeat, cfg)):
+            key = fold_key(repeat, fold)
+            seed = cfg.base_seed + 1000 * repeat + fold
 
-    rng = np.random.RandomState(42)
+            # ---- Leakage audit: nothing may be on both sides ----
+            program_overlap = len(set(groups[train_idx]) & set(groups[test_idx]))
+            function_overlap = len(set(data.func_ids[train_idx]) & set(data.func_ids[test_idx]))
+            hash_overlap = len(set(data.hashes[train_idx]) & set(data.hashes[test_idx]))
+            clean = program_overlap == 0 and function_overlap == 0 and hash_overlap == 0
+            leak_found = leak_found or not clean
+            audit_lines.append(
+                f"{'PASS' if clean else 'FAIL'} {pass_name} {target} {key} "
+                f"n_train={len(train_idx)} n_test={len(test_idx)} "
+                f"train_programs={len(set(groups[train_idx]))} "
+                f"test_programs={len(set(groups[test_idx]))} "
+                f"program_overlap={program_overlap} function_overlap={function_overlap} "
+                f"hash_overlap={hash_overlap}")
 
-    fold_results = []
-    xgb_prauc_vec = []
-    baseline_vecs = {"majority": [], "logistic_regression": [], "random_forest": []}
-    skipped_file = RESULTS_DIR / "skipped_folds.txt"
+            X_train, y_train = X[train_idx], y[train_idx]
+            X_test, y_test = X[test_idx], y[test_idx]
 
-    # Evaluate just once: Train on polybench, Test on mibench
-    train_mask = suites == "polybench"
-    test_mask = suites == "mibench"
+            usable, why = fold_is_usable(y_train, y_test)
+            if not usable:
+                skipped.append(f"{pass_name} {target} {key}: {why}")
+                continue
 
-    X_train, X_test = X[train_mask], X[test_mask]
-    y_train, y_test = y[train_mask], y[test_mask]
-    groups_train = groups[train_mask]
-    groups_test = groups[test_mask]
-    
-    if len(set(y_test)) < 2 or len(set(y_train)) < 2:
-        return None, None, None
+            # ---- Fit the four models on the training fold ----
+            probabilities = {}
 
-    n_pos_train = int(y_train.sum())
-    n_neg_train = len(y_train) - n_pos_train
-    spw = n_neg_train / max(n_pos_train, 1)
+            # Majority baseline: predicts the training positive rate for
+            # every sample, so its PR-AUC equals the test positive rate.
+            probabilities["majority"] = np.full(len(y_test), y_train.mean())
 
-    baselines = {
-        "majority": DummyClassifier(strategy="most_frequent"),
-        "logistic_regression": LogisticRegression(max_iter=1000, random_state=42),
-        "random_forest": RandomForestClassifier(
-            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
-        ),
+            logistic = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(max_iter=1000, class_weight="balanced", random_state=seed))
+            logistic.fit(X_train, y_train)
+            probabilities["logistic_regression"] = logistic.predict_proba(X_test)[:, 1]
+
+            forest = RandomForestClassifier(
+                n_estimators=100, max_depth=10, class_weight="balanced",
+                n_jobs=1, random_state=seed)
+            forest.fit(X_train, y_train)
+            probabilities["random_forest"] = forest.predict_proba(X_test)[:, 1]
+
+            # XGBoost: tune on the training fold only, then refit on all of it
+            best_params, tuning_note = tune_xgb(
+                X_train, y_train, groups[train_idx], configs, cfg, seed)
+            booster = make_xgb(best_params, y_train, seed)
+            booster.fit(X_train, y_train)
+            probabilities["xgboost"] = booster.predict_proba(X_test)[:, 1]
+            tuned[key] = {"params": best_params, "note": tuning_note}
+
+            # ---- Score on the test fold ----
+            for model_index, model_name in enumerate(MODEL_NAMES):
+                prob = probabilities[model_name]
+                oof[repeat, model_index, test_idx] = prob
+                predicted = (prob >= 0.5).astype(int)
+                fold_rows.append({
+                    "pass_name": pass_name, "target": target, "model": model_name,
+                    "repeat": repeat, "fold": fold,
+                    "pr_auc": round(pr_auc(y_test, prob), 6),
+                    "f1": round(float(f1_score(y_test, predicted, zero_division=0)), 6),
+                    "mcc": round(float(matthews_corrcoef(y_test, predicted)), 6),
+                    "n_train": len(train_idx), "n_test": len(test_idx),
+                    "pos_rate_train": round(float(y_train.mean()), 4),
+                    "pos_rate_test": round(float(y_test.mean()), 4),
+                })
+
+    # ---- Bootstrap over programs on the out-of-fold predictions ----
+    # For each resample of programs: PR-AUC of every model, averaged over the
+    # repeats.  The same resample is used for all models, so differences
+    # between models are paired.
+    boot = []
+    if fold_rows:
+        for idx in program_bootstrap_indices(groups, cfg.n_bootstrap, cfg.base_seed):
+            per_model = []
+            for model_index in range(len(MODEL_NAMES)):
+                values = []
+                for repeat in range(cfg.n_repeats):
+                    prob = oof[repeat, model_index, idx]
+                    ok = ~np.isnan(prob)
+                    if ok.sum() and y[idx][ok].min() != y[idx][ok].max():
+                        values.append(pr_auc(y[idx][ok], prob[ok]))
+                per_model.append(np.mean(values) if values else np.nan)
+            boot.append(per_model)
+    boot = np.array(boot, dtype=float).reshape(-1, len(MODEL_NAMES))
+
+    bootstrap = {}
+    xgb_column = MODEL_NAMES.index("xgboost")
+    for model_index, model_name in enumerate(MODEL_NAMES):
+        low, high = percentile_ci(boot[:, model_index], cfg.alpha) if len(boot) else (np.nan, np.nan)
+        entry = {"ci_low": low, "ci_high": high}
+        if model_name != "xgboost" and len(boot):
+            diff = boot[:, xgb_column] - boot[:, model_index]
+            entry["diff_ci_low"], entry["diff_ci_high"] = percentile_ci(diff, cfg.alpha)
+        bootstrap[model_name] = entry
+
+    # ---- Cross-suite check with the most frequently chosen configuration ----
+    cross_suite = []
+    modal_params = None
+    if tuned:
+        counts = Counter(json.dumps(v["params"], sort_keys=True) for v in tuned.values())
+        modal_params = json.loads(counts.most_common(1)[0][0])
+        suites = sorted(set(data.suites))
+        for train_suite in suites:
+            for test_suite in suites:
+                if train_suite == test_suite:
+                    continue
+                tr = data.suites == train_suite
+                te = data.suites == test_suite
+                row = {"pass_name": pass_name, "target": target,
+                       "train_suite": train_suite, "test_suite": test_suite,
+                       "n_train": int(tr.sum()), "n_test": int(te.sum()),
+                       "pos_rate_test": round(float(y[te].mean()), 4),
+                       "xgboost_pr_auc": None, "note": ""}
+                usable, why = fold_is_usable(y[tr], y[te])
+                if usable:
+                    model = make_xgb(modal_params, y[tr], cfg.base_seed)
+                    model.fit(X[tr], y[tr])
+                    row["xgboost_pr_auc"] = round(pr_auc(y[te], model.predict_proba(X[te])[:, 1]), 6)
+                else:
+                    row["note"] = why
+                cross_suite.append(row)
+
+    return {
+        "pass_name": pass_name, "target": target,
+        "n_samples": int(len(y)), "n_features": int(X.shape[1]),
+        "n_errors": data.n_errors,
+        "fold_rows": fold_rows, "audit_lines": audit_lines, "skipped": skipped,
+        "tuned": tuned, "modal_params": modal_params,
+        "bootstrap": bootstrap, "cross_suite": cross_suite,
+        "leak_found": leak_found,
+        "seconds": round(time.time() - start, 1),
     }
 
-    # Evaluate baselines
-    for model_name, model in baselines.items():
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        if hasattr(model, "predict_proba"):
-            y_prob = model.predict_proba(X_test)[:, 1]
-            pr_auc = average_precision_score(y_test, y_prob)
-        else:
-            pr_auc = float("nan")
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-        mcc = matthews_corrcoef(y_test, y_pred)
-        
-        # Bootstrap CI for Wilcoxon
-        boot_prauc = []
-        unique_test_programs = np.unique(groups_test)
-        if len(unique_test_programs) >= 2 and not pd.isna(pr_auc):
-            for _ in range(15): # 15 bootstrap samples to simulate the 3x5 folds for Wilcoxon
-                sampled = rng.choice(unique_test_programs, size=len(unique_test_programs), replace=True)
-                boot_idx = []
-                for p in sampled:
-                    boot_idx.extend(np.where(groups_test == p)[0])
-                if len(set(y_test[boot_idx])) >= 2:
-                    boot_prauc.append(average_precision_score(y_test[boot_idx], y_prob[boot_idx]))
-        if not boot_prauc:
-            boot_prauc = [pr_auc] * 15
-        baseline_vecs[model_name] = boot_prauc
-
-        fold_results.append({
-            "pass_name": pass_name, "target": target_name,
-            "model": model_name, "repeat": 0, "fold": 0,
-            "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
-            "mcc": round(mcc, 4),
-            "n_train": len(y_train), "n_test": len(y_test),
-            "pos_rate_train": round(y_train.mean(), 4),
-            "pos_rate_test": round(y_test.mean(), 4),
-        })
-
-    # XGBoost with nested tuning
-    xgb_model = nested_tune_xgboost(X_train, y_train, groups_train, rng)
-    y_pred = xgb_model.predict(X_test)
-    y_prob = xgb_model.predict_proba(X_test)[:, 1]
-    pr_auc = average_precision_score(y_test, y_prob)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    mcc = matthews_corrcoef(y_test, y_pred)
-
-    boot_prauc_xgb = []
-    unique_test_programs = np.unique(groups_test)
-    if len(unique_test_programs) >= 2 and not pd.isna(pr_auc):
-        for _ in range(15): # 15 bootstrap samples to simulate the 3x5 folds for Wilcoxon
-            sampled = rng.choice(unique_test_programs, size=len(unique_test_programs), replace=True)
-            boot_idx = []
-            for p in sampled:
-                boot_idx.extend(np.where(groups_test == p)[0])
-            if len(set(y_test[boot_idx])) >= 2:
-                boot_prauc_xgb.append(average_precision_score(y_test[boot_idx], y_prob[boot_idx]))
-    if not boot_prauc_xgb:
-        boot_prauc_xgb = [pr_auc] * 15
-    xgb_prauc_vec = boot_prauc_xgb
-
-    fold_results.append({
-        "pass_name": pass_name, "target": target_name,
-        "model": "xgboost", "repeat": 0, "fold": 0,
-        "pr_auc": round(pr_auc, 4), "f1": round(f1, 4),
-        "mcc": round(mcc, 4),
-        "n_train": len(y_train), "n_test": len(y_test),
-        "pos_rate_train": round(y_train.mean(), 4),
-        "pos_rate_test": round(y_test.mean(), 4),
-    })
-
-    model_path = save_dir / f"xgb_{pass_name}_{target_name}.pkl"
-    with open(model_path, "wb") as f:
-        import pickle
-        pickle.dump(xgb_model, f)
-
-    return fold_results, xgb_prauc_vec, baseline_vecs
-
-
 
 # ============================================================================
-# Wilcoxon test with Holm correction
+# Statistics across pairs
 # ============================================================================
 
-def wilcoxon_holm(xgb_vecs, baseline_vecs_all, pass_names, targets):
+def compare_with_baselines(results_df: pd.DataFrame, pair_results: dict,
+                           cfg: Settings) -> pd.DataFrame:
     """
-    Wilcoxon signed-rank test: XGBoost vs each baseline, Holm-corrected
-    across passes.
+    XGBoost against each baseline, per (pass, target):
+      - paired Wilcoxon signed-rank test on the fold PR-AUCs (two-sided)
+      - Holm correction across all (pass, target) pairs, per baseline
+      - bootstrap CI of the PR-AUC difference (from evaluate_pair)
     """
     from scipy.stats import wilcoxon
 
-    results = []
-    # Collect all p-values for Holm correction
-    raw_results = []
-
-    for baseline_name in ["majority", "logistic_regression", "random_forest"]:
-        for pass_name in pass_names:
-            for target in targets:
-                key = (pass_name, target)
-                if key not in xgb_vecs or key not in baseline_vecs_all:
-                    continue
-                xgb = np.array(xgb_vecs[key])
-                bl = np.array(baseline_vecs_all[key].get(baseline_name, []))
-                min_len = min(len(xgb), len(bl))
-                if min_len < 5:
-                    continue
-                xgb = xgb[:min_len]
-                bl = bl[:min_len]
-                diff = xgb - bl
-                if np.all(diff == 0):
-                    raw_results.append({
-                        "pass_name": pass_name, "target": target,
-                        "baseline": baseline_name,
-                        "xgb_mean": round(float(xgb.mean()), 4),
-                        "bl_mean": round(float(bl.mean()), 4),
-                        "p_value": 1.0, "statistic": 0.0,
-                    })
-                    continue
-                try:
-                    stat, p = wilcoxon(xgb, bl, alternative="greater")
-                except ValueError:
-                    stat, p = 0.0, 1.0
-                raw_results.append({
-                    "pass_name": pass_name, "target": target,
-                    "baseline": baseline_name,
-                    "xgb_mean": round(float(xgb.mean()), 4),
-                    "bl_mean": round(float(bl.mean()), 4),
-                    "p_value": float(p), "statistic": float(stat),
-                })
-
-    # Holm correction
-    if raw_results:
-        p_values = [r["p_value"] for r in raw_results]
-        corrected = holm_bonferroni(p_values)
-        for r, cp in zip(raw_results, corrected):
-            r["p_holm"] = round(cp, 6)
-            r["significant"] = cp < ALPHA
-        results = raw_results
-
-    return results
-
-
-def holm_bonferroni(p_values):
-    """Apply Holm-Bonferroni correction to a list of p-values."""
-    n = len(p_values)
-    if n == 0:
-        return []
-    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
-    corrected = [0.0] * n
-    for rank, (orig_idx, p) in enumerate(indexed):
-        corrected[orig_idx] = min(1.0, p * (n - rank))
-    # Enforce monotonicity
-    indexed_corrected = sorted(enumerate(corrected), key=lambda x: p_values[x[0]])
-    running_max = 0.0
-    for orig_idx, _ in indexed_corrected:
-        corrected[orig_idx] = max(corrected[orig_idx], running_max)
-        running_max = corrected[orig_idx]
-    return corrected
-
-
-# ============================================================================
-# Threshold sensitivity
-# ============================================================================
-
-def threshold_sensitivity(df_labels, df_features, feature_cols, kept_passes):
-    """
-    Recompute the beneficial label at 0.5%, 1%, 2% thresholds.
-    Report label rates and top-5 SHAP features at each threshold.
-    """
-    import pandas as pd
-    import shap
-    from sklearn.model_selection import StratifiedGroupKFold
-    from xgboost import XGBClassifier
-
-    results = []
-
-    df_merged = pd.merge(
-        df_labels, df_features,
-        on=["ir_hash", "suite", "program", "function"],
-        how="inner",
-    )
-
-    for threshold in THRESHOLDS:
-        for pass_name in kept_passes:
-            pass_df = df_merged[df_merged["pass_name"] == pass_name].copy()
-            from scripts.targets import build_target_labels
-            y = build_target_labels(pass_df, pass_name, "beneficial", threshold).values.astype(int)
-            
-            if len(pass_df) < 20:
+    rows = []
+    for (pass_name, target), group in results_df.groupby(["pass_name", "target"], sort=False):
+        wide = group.pivot_table(index=["repeat", "fold"], columns="model", values="pr_auc")
+        boot = pair_results[(pass_name, target)]["bootstrap"]
+        for baseline in MODEL_NAMES:
+            if baseline == "xgboost":
                 continue
-
-            pos_rate = y.mean()
-
-            X = pass_df[feature_cols].values.astype(np.float32)
-            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-            groups = pass_df["program"].values
-
-            top5 = []
-            if 0.05 <= pos_rate <= 0.95:
-                n_splits = min(5, len(set(groups)))
-                if n_splits >= 2:
-                    gkf = StratifiedGroupKFold(n_splits=n_splits)
-                    try:
-                        train_idx, test_idx = next(iter(gkf.split(X, y, groups)))
-                        n_pos = int(y[train_idx].sum())
-                        n_neg = len(y[train_idx]) - n_pos
-                        model = XGBClassifier(
-                            n_estimators=200, max_depth=6, learning_rate=0.1,
-                            scale_pos_weight=n_neg / max(n_pos, 1),
-                            random_state=42, eval_metric="logloss",
-                        )
-                        model.fit(X[train_idx], y[train_idx])
-                        explainer = shap.TreeExplainer(model)
-                        sv = explainer.shap_values(X[test_idx])
-                        mean_abs = np.mean(np.abs(sv), axis=0)
-                        top5_idx = np.argsort(-mean_abs)[:5]
-                        top5 = [feature_cols[i] for i in top5_idx]
-                    except Exception as e:
-                        log.warning("Threshold sensitivity SHAP failed for %s @ %.1f%%: %s",
-                                    pass_name, threshold * 100, e)
-
-            results.append({
-                "pass_name": pass_name,
-                "threshold": threshold,
-                "pos_rate": round(pos_rate, 4),
-                "n_samples": len(y),
-                "top5_shap": "; ".join(top5) if top5 else "N/A",
+            diff = (wide["xgboost"] - wide[baseline]).to_numpy()
+            p_value = float("nan")
+            if len(diff) >= 6 and np.any(diff != 0):
+                p_value = float(wilcoxon(wide["xgboost"], wide[baseline],
+                                         zero_method="wilcox", alternative="two-sided").pvalue)
+            rows.append({
+                "pass_name": pass_name, "target": target, "baseline": baseline,
+                "n_folds": len(diff),
+                "xgboost_mean": round(float(wide["xgboost"].mean()), 6),
+                "baseline_mean": round(float(wide[baseline].mean()), 6),
+                "mean_difference": round(float(diff.mean()), 6),
+                "p_value": p_value,
+                "diff_ci_low": boot[baseline].get("diff_ci_low"),
+                "diff_ci_high": boot[baseline].get("diff_ci_high"),
             })
+    comparison = pd.DataFrame(rows)
+    if comparison.empty:
+        return comparison
 
-    return results
+    # Holm correction across pairs, separately for each baseline
+    comparison["p_holm"] = np.nan
+    for baseline, group in comparison.groupby("baseline"):
+        comparison.loc[group.index, "p_holm"] = holm_correction(group["p_value"].tolist())
+
+    # "Better" needs the test AND the program bootstrap to agree.
+    # (Smoke settings have too few folds for the test and use the bootstrap
+    #  alone; smoke numbers are not results.)
+    test_passed = comparison["p_holm"] < cfg.alpha
+    if not cfg.require_wilcoxon:
+        test_passed = pd.Series(True, index=comparison.index)
+    comparison["xgboost_better"] = (
+        (comparison["mean_difference"] > 0)
+        & test_passed
+        & (comparison["diff_ci_low"] > 0))
+    return comparison
+
+
+def summarise(results_df: pd.DataFrame, pair_results: dict) -> pd.DataFrame:
+    """Mean and spread of the fold metrics, plus the program-bootstrap CI."""
+    rows = []
+    for (pass_name, target, model), group in results_df.groupby(
+            ["pass_name", "target", "model"], sort=False):
+        boot = pair_results[(pass_name, target)]["bootstrap"][model]
+        rows.append({
+            "pass_name": pass_name, "target": target, "model": model,
+            "n_folds": len(group),
+            "pr_auc_mean": round(group["pr_auc"].mean(), 4),
+            "pr_auc_std": round(group["pr_auc"].std(ddof=1), 4) if len(group) > 1 else None,
+            "pr_auc_ci_low": None if boot["ci_low"] is None else round(boot["ci_low"], 4),
+            "pr_auc_ci_high": None if boot["ci_high"] is None else round(boot["ci_high"], 4),
+            "f1_mean": round(group["f1"].mean(), 4),
+            "mcc_mean": round(group["mcc"].mean(), 4),
+        })
+    return pd.DataFrame(rows)
 
 
 # ============================================================================
-# Main pipeline
+# Main
 # ============================================================================
 
-def run_phase4(smoke: bool = False):
-    """Execute Phase 4: train and evaluate models."""
-    check_disk_space()
+def run_phase4(smoke: bool = False, n_jobs: int = 2, only: Optional[str] = None,
+               force: bool = False):
+    """Execute Phase 4."""
     ensure_dirs()
-    import pandas as pd
+    cfg = get_settings(smoke)
+    guard = DiskGuard()
+    start = time.time()
 
-    # Load features
-    features_path = FEATURES_DIR / "features.csv"
-    if not features_path.exists():
-        log.error("Features not found — run Phase 2 first.")
-        sys.exit(1)
-    df_features = pd.read_csv(features_path)
+    features, labels = load_dataset()
+    feature_names, constant_columns = feature_columns(features)
+    passes = select_passes(smoke, only)
 
-    # Load labels
-    labels_path = LABELS_DIR / "labels.csv"
-    if not labels_path.exists():
-        log.error("Labels not found — run Phase 3 first.")
-        sys.exit(1)
-    df_labels = pd.read_csv(labels_path)
+    # ---- Keep rule first: nothing is fitted for a dropped target ----
+    master = target_table(labels, cfg, passes)
+    kept = master[master["keep_status"] == "kept"]
+    pairs = list(zip(kept["pass_name"], kept["target"]))
+    log.info("Settings: %s | passes: %d | targets kept: %d of %d | features: %d "
+             "(dropped constant: %s)", cfg.name, len(passes), len(pairs), len(master),
+             len(feature_names), constant_columns or "none")
+    log.info("\n%s", master[["pass_name", "target", "positive_rate", "keep_status",
+                             "keep_reason"]].to_string(index=False))
+    if not pairs:
+        raise RuntimeError("No target passes the keep rule.")
 
-    # Load kept passes
-    kept_path = LABELS_DIR / "kept_passes.json"
-    if kept_path.exists():
-        with open(kept_path) as f:
-            kept_passes = json.load(f)
-    else:
-        kept_passes = list(df_labels["pass_name"].unique())
-    log.info("Kept passes: %s", kept_passes)
+    # ---- Resume cache: one small JSON file per finished pair ----
+    cache = cache_dir("phase4", cfg)
+    pair_results = {}
+    todo = []
+    for pass_name, target in pairs:
+        path = cache / f"{pass_name}__{target}.json"
+        if path.exists() and not force:
+            pair_results[(pass_name, target)] = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            todo.append((pass_name, target))
+    log.info("Pairs: %d cached, %d to run.", len(pair_results), len(todo))
 
-    # Merge features with labels
-    df_merged = pd.merge(
-        df_labels, df_features,
-        on=["ir_hash", "suite", "program", "function"],
-        how="inner",
-    )
-    log.info("Merged dataset: %d rows", len(df_merged))
+    if todo:
+        jobs = safe_n_jobs(n_jobs)
+        if jobs == 1:
+            finished = (evaluate_pair(p, t, cfg) for p, t in todo)
+        else:
+            from joblib import Parallel, delayed
+            # max_nbytes=None: never write arguments to memory-mapped temp files
+            finished = Parallel(n_jobs=jobs, return_as="generator_unordered",
+                                max_nbytes=None)(
+                delayed(evaluate_pair)(p, t, cfg) for p, t in todo)
+        run_start = time.time()
+        for done_count, result in enumerate(finished, start=1):
+            key = (result["pass_name"], result["target"])
+            pair_results[key] = result
+            write_json_small(cache / f"{key[0]}__{key[1]}.json", result, max_mb=2.0)
+            guard.check()
+            elapsed = time.time() - run_start
+            remaining = elapsed / done_count * (len(todo) - done_count)
+            log.info("[%d/%d] %s %s done in %.0fs | elapsed %.0fs | remaining ~%.0fs",
+                     done_count, len(todo), key[0], key[1], result["seconds"],
+                     elapsed, remaining)
 
-    if len(df_merged) == 0:
-        log.error("No data after merge — check feature/label alignment.")
-        sys.exit(1)
+    # ---- Collect, in the fixed order of the master table ----
+    fold_rows, audit_lines, skipped, cross_suite = [], [], [], []
+    tuned_all = {}
+    for pass_name, target in pairs:
+        result = pair_results[(pass_name, target)]
+        fold_rows.extend(result["fold_rows"])
+        audit_lines.extend(result["audit_lines"])
+        skipped.extend(result["skipped"])
+        cross_suite.extend(result["cross_suite"])
+        tuned_all[pair_key(pass_name, target)] = {
+            "folds": result["tuned"], "modal_params": result["modal_params"]}
 
-    feature_cols = get_feature_columns(df_features)
-    feature_cols = [c for c in feature_cols if c in df_merged.columns]
-    log.info("Using %d features", len(feature_cols))
+    results_df = pd.DataFrame(fold_rows)
+    comparison = compare_with_baselines(results_df, pair_results, cfg)
+    summary = summarise(results_df, pair_results)
 
-    # Create model save directory
-    models_dir = DATA_DIR / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
+    # ---- Write the result files ----
+    results_df.to_csv(RESULTS_DIR / "phase4_results.csv", index=False)
+    summary.to_csv(RESULTS_DIR / "phase4_summary.csv", index=False)
+    comparison.to_csv(RESULTS_DIR / "phase4_wilcoxon.csv", index=False)
+    pd.DataFrame(cross_suite).to_csv(RESULTS_DIR / "phase4_cross_suite.csv", index=False)
+    TUNED_PARAMS.write_text(json.dumps({
+        "settings": cfg.name, "feature_names": feature_names,
+        "dropped_constant_columns": constant_columns, "pairs": tuned_all,
+    }, indent=1), encoding="utf-8")
+    (RESULTS_DIR / "leakage_audit.txt").write_text(
+        "# One line per outer fold: PASS means no program, function or IR hash "
+        "is in both the training and the test fold.\n" + "\n".join(audit_lines) + "\n",
+        encoding="utf-8")
+    (RESULTS_DIR / "skipped_folds.txt").write_text(
+        "# Outer folds that could not be scored, with the reason.\n"
+        + "\n".join(skipped) + ("\n" if skipped else ""), encoding="utf-8")
 
-    # Clean old models
-    for old in models_dir.glob("*.pkl"):
-        old.unlink()
+    # ---- Master table: add the Phase 4 verdict to every pass x target ----
+    xgb_summary = summary[summary["model"] == "xgboost"].set_index(["pass_name", "target"])
+    vs_majority = (comparison[comparison["baseline"] == "majority"]
+                   .set_index(["pass_name", "target"]) if not comparison.empty else None)
+    extra = []
+    for row in master.itertuples():
+        key = (row.pass_name, row.target)
+        info = {"valid_folds": None, "xgboost_pr_auc": None, "majority_pr_auc": None,
+                "p_holm_vs_majority": None, "diff_ci_low_vs_majority": None,
+                "beats_majority": None, "model_status": "", "model_reason": ""}
+        if row.keep_status != "kept":
+            info["model_status"] = "not fitted"
+            info["model_reason"] = "dropped by the keep rule"
+        elif key not in xgb_summary.index:
+            info["model_status"] = "not scored"
+            info["model_reason"] = "no outer fold had both classes"
+        else:
+            cmp_row = vs_majority.loc[key]
+            n_valid = int(xgb_summary.loc[key, "n_folds"])
+            info.update({
+                "valid_folds": n_valid,
+                "xgboost_pr_auc": xgb_summary.loc[key, "pr_auc_mean"],
+                "majority_pr_auc": round(float(cmp_row["baseline_mean"]), 4),
+                "p_holm_vs_majority": cmp_row["p_holm"],
+                "diff_ci_low_vs_majority": cmp_row["diff_ci_low"],
+                "beats_majority": bool(cmp_row["xgboost_better"]) and n_valid >= cfg.min_valid_folds,
+            })
+            if n_valid < cfg.min_valid_folds:
+                info["model_status"] = "not interpretable"
+                info["model_reason"] = (f"only {n_valid} usable outer folds "
+                                        f"(minimum {cfg.min_valid_folds})")
+            elif info["beats_majority"]:
+                info["model_status"] = "beats majority"
+            else:
+                info["model_status"] = "not interpretable"
+                info["model_reason"] = ("XGBoost does not beat the majority baseline "
+                                        "(Holm-corrected Wilcoxon and program bootstrap)")
+        extra.append(info)
+    master = pd.concat([master, pd.DataFrame(extra)], axis=1)
+    master.to_csv(MASTER_TABLE, index=False)
 
-    # Init leakage audit and skipped folds files
-    audit_file = RESULTS_DIR / "leakage_audit.txt"
-    audit_file.write_text("# Leakage Audit\n", encoding="utf-8")
-    skipped_file = RESULTS_DIR / "skipped_folds.txt"
-    skipped_file.write_text("# Skipped Folds\n", encoding="utf-8")
+    # ---- Gate report ----
+    n_fail = sum(line.startswith("FAIL") for line in audit_lines)
+    n_beats = int((master["model_status"] == "beats majority").sum())
+    lines = [
+        "PHASE 4 GATE REPORT",
+        "=" * 70,
+        f"Settings:                         {cfg.name}"
+        + ("   (SMOKE: these numbers are not results)" if smoke else ""),
+        f"Passes considered:                {len(passes)}",
+        f"Pass x target pairs:              {len(master)}",
+        f"  kept by the 5%-95% rule:        {len(pairs)}",
+        f"  dropped by the rule:            {len(master) - len(pairs)}",
+        f"Outer CV:                         {cfg.n_repeats} repeats x {cfg.n_outer_folds} folds, "
+        f"grouped by program",
+        f"Tuning:                           {cfg.n_tuning_configs} configurations, "
+        f"{cfg.n_inner_folds} inner folds",
+        f"Features:                         {len(feature_names)}"
+        f" (dropped constant: {', '.join(constant_columns) or 'none'})",
+        f"Outer folds audited:              {len(audit_lines)}  (FAIL: {n_fail})",
+        f"Outer folds skipped (one class):  {len(skipped)}",
+        f"Targets where XGBoost beats the majority baseline: {n_beats} of {len(pairs)}",
+        f"Run time this session:            {time.time() - start:.0f} s",
+        "",
+        master[["pass_name", "target", "positive_rate", "keep_status", "valid_folds",
+                "xgboost_pr_auc", "majority_pr_auc", "p_holm_vs_majority",
+                "model_status"]].to_string(index=False),
+    ]
+    report = "\n".join(lines) + "\n"
+    (RESULTS_DIR / "phase4_gate.txt").write_text(report, encoding="utf-8")
+    log.info("\n%s", report)
 
-    # ---- Train and evaluate per pass, per target ----
-    all_fold_results = []
-    xgb_vecs = {}
-    baseline_vecs_all = {}
-    targets_to_process = ["beneficial", "harmful", "fired"]
-
-    target_status = {}  # (pass, target) -> kept/dropped
-
-    for pass_name in kept_passes:
-        for target_name in targets_to_process:
-            fold_results, xgb_vec, bl_vecs = train_and_evaluate_pass(
-                pass_name, target_name, df_merged, feature_cols,
-                models_dir, str(audit_file),
-            )
-            key = (pass_name, target_name)
-            if fold_results is None:
-                target_status[key] = "dropped"
-                continue
-
-            target_status[key] = "kept"
-            all_fold_results.extend(fold_results)
-            if xgb_vec:
-                xgb_vecs[key] = xgb_vec
-            if bl_vecs:
-                baseline_vecs_all[key] = bl_vecs
-
-    if not all_fold_results:
-        log.error("No model results generated!")
-        sys.exit(1)
-
-    # Save per-fold results
-    df_results = pd.DataFrame(all_fold_results)
-    results_path = RESULTS_DIR / "phase4_results.csv"
-    df_results.to_csv(results_path, index=False)
-    log.info("Per-fold results saved to %s", results_path)
-
-    # ---- Summary table (mean + bootstrap CI) ----
-    summary_rows = []
-    for pass_name in kept_passes:
-        for target_name in targets_to_process:
-            for model_name in ["majority", "logistic_regression", "random_forest", "xgboost"]:
-                mask = ((df_results["pass_name"] == pass_name) &
-                        (df_results["target"] == target_name) &
-                        (df_results["model"] == model_name))
-                subset = df_results[mask]
-                if len(subset) == 0:
-                    continue
-                vals = subset["pr_auc"].values
-                mean_val = float(vals.mean())
-                std_val = float(vals.std())
-                # Simple percentile CI (not program-bootstrap — that's only available in phase5)
-                if len(vals) >= 5:
-                    ci_lo = float(np.percentile(vals, 2.5))
-                    ci_hi = float(np.percentile(vals, 97.5))
-                else:
-                    ci_lo, ci_hi = mean_val, mean_val
-                summary_rows.append({
-                    "pass_name": pass_name,
-                    "target": target_name,
-                    "model": model_name,
-                    "pr_auc_mean": round(mean_val, 4),
-                    "pr_auc_std": round(std_val, 4),
-                    "pr_auc_ci_lo": round(ci_lo, 4),
-                    "pr_auc_ci_hi": round(ci_hi, 4),
-                    "f1_mean": round(float(subset["f1"].mean()), 4),
-                    "mcc_mean": round(float(subset["mcc"].mean()), 4),
-                })
-
-    df_summary = pd.DataFrame(summary_rows)
-    summary_path = RESULTS_DIR / "phase4_summary.csv"
-    df_summary.to_csv(summary_path, index=False)
-    log.info("Summary saved to %s", summary_path)
-
-    # ---- Wilcoxon signed-rank test ----
-    active_targets = list(set(t for _, t in xgb_vecs.keys()))
-    wilcoxon_results = wilcoxon_holm(xgb_vecs, baseline_vecs_all, kept_passes, active_targets)
-    if wilcoxon_results:
-        df_wilcoxon = pd.DataFrame(wilcoxon_results)
-        df_wilcoxon.to_csv(RESULTS_DIR / "phase4_wilcoxon.csv", index=False)
-        log.info("Wilcoxon results saved")
-
-    # ---- Threshold sensitivity ----
-    thresh_results = threshold_sensitivity(df_labels, df_features, feature_cols, kept_passes)
-    if thresh_results:
-        df_thresh = pd.DataFrame(thresh_results)
-        df_thresh.to_csv(RESULTS_DIR / "threshold_sensitivity.csv", index=False)
-        log.info("Threshold sensitivity saved")
-
-    # ---- Gate: flag passes where XGBoost doesn't beat majority after Holm correction ----
-    interpretable = {}
-    for pass_name in kept_passes:
-        for target_name in active_targets:
-            key = (pass_name, target_name)
-            if key not in xgb_vecs:
-                continue
-            # Check Wilcoxon result
-            beats_majority = False
-            if wilcoxon_results:
-                for wr in wilcoxon_results:
-                    if (wr["pass_name"] == pass_name and
-                        wr["target"] == target_name and
-                        wr["baseline"] == "majority" and
-                        wr.get("significant", False)):
-                        beats_majority = True
-                        break
-            interpretable[key] = beats_majority
-
-    # Save interpretable passes
-    interp_passes_list = [p for p in kept_passes
-                          if any(interpretable.get((p, t), False) for t in active_targets)]
-    interp_path = LABELS_DIR / "interpretable_passes.json"
-    with open(interp_path, "w") as f:
-        json.dump(interp_passes_list, f)
-
-    # Save target status
-    target_status_path = LABELS_DIR / "target_status.json"
-    with open(target_status_path, "w") as f:
-        json.dump({f"{k[0]}_{k[1]}": v for k, v in target_status.items()}, f, indent=2)
-
-    flagged = [p for p in kept_passes if not any(interpretable.get((p, t), False) for t in active_targets)]
-
-    report = f"""
-╔══════════════════════════════════════════════════════╗
-║              PHASE 4 GATE REPORT                     ║
-╠══════════════════════════════════════════════════════╣
-║ Passes evaluated:       {len(kept_passes):>8}                     ║
-║ Targets per pass:       {len(targets_to_process):>8}                     ║
-║ Repeats x folds:        {N_REPEATS}x{N_OUTER_FOLDS} = {N_REPEATS * N_OUTER_FOLDS:>4}                    ║
-║ XGB beats majority:     {len(interp_passes_list):>8}                     ║
-║ Flagged passes:         {len(flagged):>8}                     ║
-╚══════════════════════════════════════════════════════╝
-"""
-    log.info(report)
-    gate_path = RESULTS_DIR / "phase4_gate.txt"
-    gate_path.write_text(report, encoding='utf-8')
-
-    # Save feature column list for downstream phases
-    with open(FEATURES_DIR / "feature_columns.json", "w") as f:
-        json.dump(feature_cols, f)
+    if n_fail or any(r["leak_found"] for r in pair_results.values()):
+        raise RuntimeError("Leakage audit FAILED. See results/leakage_audit.txt.")
 
 
 # ============================================================================
@@ -717,10 +485,13 @@ def run_phase4(smoke: bool = False):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 4: Train and evaluate models")
-    parser.add_argument("--smoke", action="store_true")
+    parser = argparse.ArgumentParser(description="Phase 4: models and cross-validation")
+    parser.add_argument("--smoke", action="store_true", help="tiny settings, a few passes")
+    parser.add_argument("--jobs", type=int, default=2, help="parallel worker processes")
+    parser.add_argument("--only", type=str, default=None, help="comma-separated pass names")
+    parser.add_argument("--force", action="store_true", help="ignore the resume cache")
     args = parser.parse_args()
-    run_phase4(smoke=args.smoke)
+    run_phase4(smoke=args.smoke, n_jobs=args.jobs, only=args.only, force=args.force)
 
 
 if __name__ == "__main__":

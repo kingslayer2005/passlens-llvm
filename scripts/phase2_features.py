@@ -12,7 +12,8 @@ For each function .ll file, extracts ~60 features:
   - log(instruction_count) as a separate feature
 
 Output:
-  data/features/features.csv — one row per function, columns = feature names
+  data/features/features_baseline.csv — one row per baseline function.
+  (data/features/features.csv, one row per state, is written by Phase 3.)
 
 Usage:
   python -m scripts.phase2_features [--smoke]
@@ -600,7 +601,10 @@ def run_phase2(smoke: bool = False):
     # Save to CSV
     if all_features:
         df_features = pd.DataFrame(all_features)
-        output_path = FEATURES_DIR / "features.csv"
+        # Baseline functions only.  The modelling table (features.csv, one
+        # row per STATE) is written by Phase 3, which also measures the
+        # states reached by pass prefixes; this file must not overwrite it.
+        output_path = FEATURES_DIR / "features_baseline.csv"
         df_features.to_csv(output_path, index=False)
         log.info("Saved features to %s (%d rows, %d columns)",
                  output_path, len(df_features), len(df_features.columns))

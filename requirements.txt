@@ -1,15 +1,15 @@
-# Pinned dependencies for LLVM IR SHAP research project
-# Python 3.10+ required
+# Python 3.10 or newer.  Install inside WSL / Linux:
+#   pip install --no-cache-dir -r requirements.txt
+#
+# Versions the code was last tested with (Python 3.13):
+#   numpy 2.5.3, pandas 3.0.5, scipy 1.18.1, scikit-learn 1.9.1,
+#   xgboost-cpu 3.4.1, shap 0.53.0, matplotlib 3.11.2, joblib 1.6.0, PyYAML 6.0.3
+numpy
+pandas
+scipy
+scikit-learn
 xgboost-cpu
 shap
-scikit-learn
-pandas
 matplotlib
-numpy
-scipy
-pyyaml
 joblib
-tqdm
-seaborn
-
-tabulate==0.10.0
+pyyaml

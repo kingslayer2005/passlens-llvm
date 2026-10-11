@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-run_all.py — Master orchestrator for the LLVM IR SHAP research pipeline.
+run_all.py — Runs the pipeline phases in order.
 
-Runs every phase in order with caching (skips phases whose outputs already exist).
+  Phase 1  fetch benchmarks, compile to IR, select functions
+  Phase 2  baseline feature table (a check of the extractor)
+  Phase 3  states, features and labels          -> data/features, data/labels
+  Phase 4  models and cross-validation          -> results/master_table.csv
+  Phase 5  SHAP, trust checks, heuristic agreement
+  Phase 6  explanation-guided feature pruning
+  Phase 7  sequence-level evaluation
+  then     results/RESULTS.md is rebuilt from the result files
 
 Flags:
-  --smoke    Run the full pipeline on 3 programs in <5 minutes.
-  --phase N  Run only phase N (1-7).
-  --force    Force re-run even if outputs exist.
-  --jobs N   Number of parallel jobs for Phases 1 and 3.
+  --smoke          tiny settings to check that the code runs (NOT results)
+  --phase N        run only phase N
+  --from-phase N   run phases N..7
+  --jobs N         parallel workers (default 2; lowered if memory is short)
+  --only a,b       Phases 4-6: only these passes (for testing)
+  --force          redo a phase even if its outputs / cache exist
+  --refreeze-heuristics   accept a changed heuristics.yaml (see below)
 
-Usage:
-  python run_all.py --smoke          # fast end-to-end test
-  python run_all.py                  # full run
-  python run_all.py --phase 4        # run only Phase 4
+heuristics.yaml is the list of expectations the model is compared with.  Its
+SHA-256 is stored in env.json; if the file changes afterwards the run stops,
+because changing expectations after seeing results would make the comparison
+meaningless.  Use --refreeze-heuristics only before any result exists.
+
+Examples:
+  python run_all.py --smoke --from-phase 4     # quick check of Phases 4-7
+  python run_all.py --from-phase 4 --jobs 2    # full analysis on existing data
 """
 
 import argparse
@@ -24,257 +38,129 @@ import sys
 import time
 from pathlib import Path
 
-# Add project root to path so scripts can find each other
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.utils import (
     DATA_DIR, FEATURES_DIR, LABELS_DIR, RESULTS_DIR,
-    ensure_dirs, find_llvm_tools, save_env_json, setup_logging,
-    check_disk_space,
+    check_disk_space, ensure_dirs, find_llvm_tools, save_env_json, setup_logging,
 )
 
 log = setup_logging("run_all")
 
-# ============================================================================
-# Phase gate checks: does the output from this phase already exist?
-# ============================================================================
-
-def phase1_done() -> bool:
-    return (DATA_DIR / "function_index.csv").exists()
-
-def phase2_done() -> bool:
-    return (FEATURES_DIR / "features.csv").exists()
-
-def phase3_done() -> bool:
-    return (LABELS_DIR / "labels.csv").exists()
-
-def phase4_done() -> bool:
-    return (RESULTS_DIR / "phase4_summary.csv").exists()
-
-def phase5_done() -> bool:
-    return (RESULTS_DIR / "shap_rankings.csv").exists()
-
-def phase6_done() -> bool:
-    return (RESULTS_DIR / "phase6_pruning.csv").exists()
-
-def phase7_done() -> bool:
-    return (RESULTS_DIR / "phase7_sequence.csv").exists()
-
-def phase8_done() -> bool:
-    return (RESULTS_DIR / "stretch_distillation.csv").exists()
-
-PHASE_CHECKS = {
-    1: phase1_done,
-    2: phase2_done,
-    3: phase3_done,
-    4: phase4_done,
-    5: phase5_done,
-    6: phase6_done,
-    7: phase7_done,
-    8: phase8_done,
-}
+ENV_PATH = PROJECT_ROOT / "env.json"
+HEURISTICS_PATH = PROJECT_ROOT / "heuristics.yaml"
+LAST_PHASE = 7
 
 
-# ============================================================================
-# Phase runners
-# ============================================================================
+def data_phase_done(phase: int) -> bool:
+    """Phases 1-3 are skipped when their output file already exists."""
+    outputs = {
+        1: DATA_DIR / "function_index.csv",
+        2: FEATURES_DIR / "features_baseline.csv",
+        3: LABELS_DIR / "labels.csv",
+    }
+    return phase in outputs and outputs[phase].exists()
 
-def run_phase(phase_num: int, smoke: bool = False, force: bool = False,
-              n_jobs: int = 1):
-    """Run a single phase, skipping if output exists and force=False."""
-    check_fn = PHASE_CHECKS.get(phase_num)
-    if check_fn and check_fn() and not force:
-        log.info("Phase %d: outputs already exist, skipping. Use --force to re-run.",
-                 phase_num)
-        return True
 
-    # Disk space check before each phase
-    try:
-        check_disk_space(min_free_gb=1.0)
-    except RuntimeError as e:
-        log.error(str(e))
-        return False
+def freeze_heuristics(refreeze: bool, previous_hash: str):
+    """Store the hash of heuristics.yaml in env.json, or stop if it changed."""
+    current = hashlib.sha256(HEURISTICS_PATH.read_bytes()).hexdigest()
+    if previous_hash and previous_hash != current and not refreeze:
+        raise RuntimeError(
+            "heuristics.yaml has changed since it was frozen "
+            f"(stored {previous_hash[:12]}, now {current[:12]}). Restore the file, or "
+            "rerun with --refreeze-heuristics if no result has been produced yet.")
+    env = json.loads(ENV_PATH.read_text(encoding="utf-8")) if ENV_PATH.exists() else {}
+    env["heuristics_sha256"] = current
+    ENV_PATH.write_text(json.dumps(env, indent=2), encoding="utf-8")
+    log.info("heuristics.yaml SHA-256: %s", current)
 
+
+def run_phase(phase: int, args) -> None:
+    """Run one phase.  Errors are not caught: a failed phase stops the run."""
+    if phase <= 3 and data_phase_done(phase) and not args.force:
+        log.info("Phase %d: output exists, skipping (use --force to redo).", phase)
+        return
+
+    check_disk_space(min_free_gb=1.0)
     log.info("=" * 60)
-    log.info("PHASE %d — Starting", phase_num)
+    log.info("PHASE %d — starting", phase)
     log.info("=" * 60)
+    started = time.time()
 
-    t0 = time.time()
-    try:
-        if phase_num == 1:
-            from scripts.phase1_setup_data import run_phase1
-            run_phase1(smoke=smoke, n_jobs=n_jobs)
+    if phase == 1:
+        from scripts.phase1_setup_data import run_phase1
+        run_phase1(smoke=args.smoke, n_jobs=args.jobs)
+    elif phase == 2:
+        from scripts.phase2_features import run_phase2
+        run_phase2(smoke=args.smoke)
+    elif phase == 3:
+        from scripts.phase3_labels import run_phase3
+        run_phase3(smoke=args.smoke, n_jobs=args.jobs, force=args.force)
+    elif phase == 4:
+        from scripts.phase4_models import run_phase4
+        run_phase4(smoke=args.smoke, n_jobs=args.jobs, only=args.only, force=args.force)
+    elif phase == 5:
+        from scripts.phase5_shap import run_phase5
+        run_phase5(smoke=args.smoke, n_jobs=args.jobs, only=args.only, force=args.force)
+    elif phase == 6:
+        from scripts.phase6_pruning import run_phase6
+        run_phase6(smoke=args.smoke, n_jobs=args.jobs, only=args.only, force=args.force)
+    elif phase == 7:
+        from scripts.phase7_sequence import run_phase7
+        run_phase7(smoke=args.smoke, n_jobs=args.jobs)
 
-        elif phase_num == 2:
-            from scripts.phase2_features import run_phase2
-            run_phase2(smoke=smoke)
-
-        elif phase_num == 3:
-            from scripts.phase3_labels import run_phase3
-            run_phase3(smoke=smoke, n_jobs=n_jobs, force=force)
-
-        elif phase_num == 4:
-            from scripts.phase4_models import run_phase4
-            run_phase4(smoke=smoke)
-
-        elif phase_num == 5:
-            from scripts.phase5_shap import run_phase5
-            run_phase5(smoke=smoke)
-
-        elif phase_num == 6:
-            from scripts.phase6_pruning import run_phase6
-            run_phase6(smoke=smoke)
-
-        elif phase_num == 7:
-            from scripts.phase7_sequence import run_phase7
-            run_phase7(smoke=smoke)
-
-        elif phase_num == 8:
-            from scripts.phase8_stretch import run_phase8
-            run_phase8(smoke=smoke)
-
-        else:
-            log.error("Unknown phase: %d", phase_num)
-            return False
-
-        elapsed = time.time() - t0
-        log.info("Phase %d completed in %.1f seconds", phase_num, elapsed)
-        return True
-
-    except Exception as e:
-        elapsed = time.time() - t0
-        log.error("Phase %d FAILED after %.1f seconds: %s", phase_num, elapsed, e)
-        import traceback
-        traceback.print_exc()
-        return False
+    log.info("Phase %d finished in %.0f s", phase, time.time() - started)
 
 
-# ============================================================================
-# Main
-# ============================================================================
+def folder_size_mb(path: Path) -> float:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="LLVM IR SHAP Research Pipeline — Master Orchestrator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python run_all.py --smoke          # Fast end-to-end test (~5 min)
-  python run_all.py                  # Full pipeline run
-  python run_all.py --phase 5        # Run only Phase 5 (SHAP)
-  python run_all.py --force          # Force re-run all phases
-        """,
-    )
-    parser.add_argument("--smoke", action="store_true",
-                        help="Smoke test: process only 3 programs, <5 min target")
-    parser.add_argument("--phase", type=int, choices=range(1, 9),
-                        help="Run only the specified phase (1-8)")
-    parser.add_argument("--force", action="store_true",
-                        help="Force re-run even if outputs exist")
-    parser.add_argument("--jobs", type=int, default=1,
-                        help="Number of parallel jobs for Phase 3")
-    parser.add_argument("--log-file", type=str, default=None,
-                        help="Log output to this file as well as stderr")
+    parser = argparse.ArgumentParser(description="Run the pipeline phases in order",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog=__doc__)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--phase", type=int, choices=range(1, LAST_PHASE + 1))
+    parser.add_argument("--from-phase", type=int, choices=range(1, LAST_PHASE + 1), default=1)
+    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--only", type=str, default=None)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--refreeze-heuristics", action="store_true")
+    parser.add_argument("--log-file", type=str, default=None)
     args = parser.parse_args()
 
-    # ---- Setup file logging ----
     if args.log_file:
         from logging.handlers import RotatingFileHandler
-        fh = RotatingFileHandler(args.log_file, mode="a", maxBytes=20*1024*1024, backupCount=1)
-        fh.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-        logging.getLogger().addHandler(fh)
-        log.addHandler(fh)
+        handler = RotatingFileHandler(args.log_file, maxBytes=20 * 1024 * 1024, backupCount=1)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(handler)   # every phase logger passes through the root
 
-    # ---- Setup ----
     ensure_dirs()
     total_start = time.time()
+    log.info("Mode: %s", "SMOKE TEST (not results)" if args.smoke else "FULL RUN")
 
-    log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║   LLVM IR SHAP Research Pipeline                       ║")
-    log.info("║   Mode: %s                                    ║",
-             "SMOKE TEST" if args.smoke else "FULL RUN  ")
-    log.info("╚══════════════════════════════════════════════════════════╝")
+    # Environment record and the heuristics freeze
+    previous_hash = ""
+    if ENV_PATH.exists():
+        previous_hash = json.loads(ENV_PATH.read_text(encoding="utf-8")).get("heuristics_sha256", "")
+    tools = find_llvm_tools()
+    save_env_json(tools, seeds=[42])
+    freeze_heuristics(args.refreeze_heuristics, previous_hash)
 
-    # ---- Find and verify LLVM tools ----
-    try:
-        tools = find_llvm_tools()
-        log.info("LLVM tools found: %s", list(tools.keys()))
-    except RuntimeError as e:
-        log.error(str(e))
-        log.error("Please run setup_wsl.sh first to install LLVM tools.")
-        sys.exit(1)
+    phases = [args.phase] if args.phase else list(range(args.from_phase, LAST_PHASE + 1))
+    for phase in phases:
+        run_phase(phase, args)
 
-    # ---- Save environment info ----
-    seeds = [42, 43, 44, 45, 46]  # seeds used across the pipeline
-    save_env_json(tools, seeds)
+    # RESULTS.md is always rebuilt from whatever result files exist
+    from scripts.generate_results_md import generate
+    generate()
 
-    # ---- Freeze heuristics.yaml ----
-    heuristics_path = PROJECT_ROOT / "heuristics.yaml"
-    if heuristics_path.exists():
-        h_text = heuristics_path.read_bytes()
-        h_sha256 = hashlib.sha256(h_text).hexdigest()
-        log.info("heuristics.yaml SHA-256: %s", h_sha256)
-
-        # Store SHA in env.json
-        env_path = PROJECT_ROOT / "env.json"
-        if env_path.exists():
-            with open(env_path) as f:
-                env = json.load(f)
-            env["heuristics_sha256"] = h_sha256
-            with open(env_path, "w") as f:
-                json.dump(env, f, indent=2)
-
-    # ---- Run phases ----
-    if args.phase:
-        # Run only the specified phase
-        success = run_phase(args.phase, smoke=args.smoke, force=args.force,
-                            n_jobs=args.jobs)
-        if not success:
-            sys.exit(1)
-    else:
-        # Run all phases in order
-        for phase_num in range(1, 9):
-            success = run_phase(phase_num, smoke=args.smoke, force=args.force,
-                                n_jobs=args.jobs)
-            if not success:
-                log.error("Pipeline stopped at Phase %d. Fix the error and re-run.",
-                          phase_num)
-                sys.exit(1)
-
-    # ---- Generate RESULTS.md ----
-    log.info("Generating RESULTS.md ...")
-    try:
-        from scripts.generate_results_md import generate
-        generate()
-    except Exception as e:
-        log.warning("RESULTS.md generation failed: %s", e)
-
-    # ---- Summary ----
-    total_elapsed = time.time() - total_start
-
-    # Report disk usage
-    import shutil
-    results_size = sum(f.stat().st_size for f in RESULTS_DIR.rglob("*") if f.is_file())
-    data_size = sum(f.stat().st_size for f in DATA_DIR.rglob("*") if f.is_file())
-    total_size = results_size + data_size
-
-    log.info("")
-    log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║   Pipeline complete!                                   ║")
-    log.info("║   Total time: %6.0f seconds (%4.1f minutes)             ║",
-             total_elapsed, total_elapsed / 60)
-    log.info("║   Results size:  %7.1f MB                              ║",
-             results_size / 1e6)
-    log.info("║   Data size:     %7.1f MB                              ║",
-             data_size / 1e6)
-    log.info("║   Total size:    %7.1f MB                              ║",
-             total_size / 1e6)
-    log.info("║   Results: results/RESULTS.md                          ║")
-    log.info("╚══════════════════════════════════════════════════════════╝")
+    log.info("Done in %.0f s. results/: %.1f MB, data/: %.1f MB",
+             time.time() - total_start, folder_size_mb(RESULTS_DIR), folder_size_mb(DATA_DIR))
 
 
 if __name__ == "__main__":

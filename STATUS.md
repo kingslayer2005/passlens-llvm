@@ -35,13 +35,37 @@ Checks that passed (`results/instcount_validation.txt`,
 
 The per-pass table is in `results/phase3_gate.txt`.
 
-### Models and explanations (Phases 4-8): NOT run on this data
+### Models and explanations (Phases 4-7): code complete, full run NOT done
 
-Everything in `results/` named `phase4_*` to `phase7_*`, `shap_*`,
-`heuristic_agreement.csv`, `stretch_runtime.csv`, the figures and
-`RESULTS.md` comes from an earlier run on 40 samples whose labels were
-produced by a faulty instruction counter. **Those files are stale and must
-not be cited.** They have to be regenerated from the data above.
+Phases 4-7 were rewritten on 2026-10-11 (see `ANALYSIS_PLAN.md`,
+Amendment 2). **No model, SHAP, heuristic-agreement, pruning or sequence
+result has been produced for the paper yet.** `results/` holds data-phase
+files only.
+
+What has been checked:
+
+- 61 unit tests pass (`python -m unittest discover tests`). Expected values
+  are worked out by hand or compared with scikit-learn and the `shap`
+  package (XGBoost's TreeSHAP equals `shap.TreeExplainer`).
+- The four phases ran end to end on the real data with `--smoke` settings,
+  and with the full settings on three passes (`simplifycfg`, `loop-rotate`,
+  `adce`) as a test of the code. Those outputs were deleted and are not
+  results: the multiple-testing correction covers all kept pairs and must
+  be computed in one complete run.
+
+How to produce the results (inside WSL, from the project folder):
+
+```
+python run_all.py --from-phase 4 --jobs 2
+python -m scripts.check_phase4
+```
+
+Measured on a 2-core machine with `--jobs 2`: Phase 4 about 65 s per kept
+(pass, target) pair, Phase 5 about 55 s, Phase 6 about 25 s, Phase 7 a few
+minutes. With 27 kept pairs that is roughly 1 to 1.5 hours in total. A run
+can be interrupted and resumed. Memory: about 1-2 GB per job; the number of
+jobs is lowered automatically when memory is short. Disk: results are a few
+megabytes; `python -m scripts.clean_workspace --yes` removes the caches.
 
 ## Defects fixed in the Phase 1-3 code on 2026-10-08
 
@@ -62,30 +86,23 @@ not be cited.** They have to be regenerated from the data above.
 8. Loop header and body sizes were estimated from block order; they now come
    from LLVM's LoopInfo.
 
-## Decision needed before Phase 4
+## Loop-pass targets (decided)
 
 In LLVM's new pass manager every loop pass first puts loops into canonical
 form (LoopSimplify + LCSSA). That step alone adds instructions in 725 of the
-2953 states. With the pre-specified "harmful" label (size after > size
-before), `loop-deletion` is harmful in 724 states, but the pass itself
-changed the IR in only 19 and increased the size in 0.
-
-`labels.csv` holds both measurements: `inst_before` (the state) and
-`inst_control` (after canonicalization only). The targets for the six loop
-passes should be defined against `inst_control`; this must be written into
-`ANALYSIS_PLAN.md` before any model is fitted.
+2953 states. For the six loop passes the `beneficial` and `harmful` targets
+are therefore measured against `inst_control` (the size after
+canonicalization alone), not `inst_before`. See `ANALYSIS_PLAN.md`, A7, and
+`scripts/targets.py`.
 
 ## Pending before paper submission
 
-- Decide the loop-pass target definition (above) and update the plan.
-- Add the `fired` target to Phases 4-6 and rerun Phases 4-7 on this data.
-- Verify every `heuristics.yaml` source by hand.
+- Run Phases 4-7 on the full data (commands above) and check the output.
+- Verify every `heuristics.yaml` entry marked `verified: false` against the
+  LLVM 17 sources by hand. The agreement scores are only as good as this file.
 - Compile coverage: 622 files fail, mostly because they need headers that
   the benchmark's own build generates (`arch.h`, `config.h`, `jconfig.h`)
   or because they are for another platform. See `LIMITATIONS.md`, section 6.
-- Remove the three LLVM source files from the repository root
-  (`JumpThreading.cpp`, `LoopRotation.cpp`, `LoopUnrollPass.cpp`); cite the
-  file, option name and release tag in `heuristics.yaml` instead.
 
 ## Phase 4 attempt on 2026-10-09 (withdrawn)
 A Phase 4 run was pushed and then withdrawn. It did not follow
@@ -94,5 +111,4 @@ test on 2664 MiBench samples) instead of repeated grouped
 cross-validation, the 15 values given to the Wilcoxon test were
 bootstrap resamples of that one test set, the 5%-95% keep rule was
 removed, and the leakage audit was not run. Its outputs were deleted
-and must not be cited. scripts/phase4_models.py to phase7_sequence.py
-do not yet implement the plan.
+and must not be cited. The scripts were rewritten on 2026-10-11.

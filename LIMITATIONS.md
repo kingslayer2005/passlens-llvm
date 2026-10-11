@@ -46,3 +46,37 @@ Loop passes in LLVM's new pass manager run LoopSimplify and LCSSA first. The
 dataset records the size after this step separately (`inst_control`), but
 the canonical form is still part of what the pass sees and produces.
 
+## 8. Statistics
+- Folds of a cross-validation share training data, and the three repeats
+  reuse the same samples, so the fold-level Wilcoxon test is optimistic. A
+  target counts as predictable only if a bootstrap over whole programs
+  agrees.
+- Several kept targets are rare (positive rate 6-12 %), and their positives
+  can sit in a few programs. Their estimates are noisy even when a test
+  passes.
+- Heuristic lists are short (one to three features per pass). A single pass
+  cannot reach significance on its own; the pooled test carries the
+  evidence, and pairs of one pass (for example `fired` and `beneficial`)
+  are not independent.
+
+## 9. What SHAP Agreement Does and Does Not Mean
+- SHAP describes which inputs the model relies on. It is not a causal
+  statement about the pass.
+- The cost-model features are proxies. LLVM's loop-rotate threshold applies
+  to the header of each loop, the unroll threshold to the unrolled size
+  (body size times trip count), and the jump-threading threshold to the
+  block being duplicated; the dataset has one number per function.
+- Agreement with `heuristics.yaml` shows that the model is consistent with
+  what a pass operates on. It does not show that the model rediscovered
+  LLVM's logic, and entries marked `verified: false` have not been checked
+  against the source.
+- Features that move together (Spearman |rho| above 0.8) are scored as one
+  cluster, because SHAP splits credit between them. `ret_density` falls in
+  the same cluster as `log_inst_count` and is treated as a size feature.
+
+## 10. Sequence Evaluation
+- The model-guided selector is greedy and uses only the `beneficial`
+  models. It is a check that the per-pass models are usable together, not a
+  competitor to `-Oz`, which also runs interprocedural and many more passes.
+- `-O2` optimizes for speed and can increase the instruction count.
+

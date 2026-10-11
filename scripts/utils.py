@@ -466,7 +466,7 @@ def collect_env_info(tools: dict, seeds: list) -> dict:
     import importlib
     packages = {}
     for pkg_name in ["xgboost", "shap", "sklearn", "pandas", "matplotlib",
-                     "numpy", "scipy", "yaml", "joblib", "tqdm", "seaborn"]:
+                     "numpy", "scipy", "yaml", "joblib"]:
         try:
             mod = importlib.import_module(pkg_name)
             packages[pkg_name] = getattr(mod, "__version__", "unknown")
